@@ -1,0 +1,20 @@
+# Build trees and compiled binaries
+/build*/
+CMakeCache.txt
+CMakeFiles/
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local audio
+*.wav
