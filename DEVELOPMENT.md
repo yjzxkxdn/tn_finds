@@ -8,17 +8,19 @@
 ## 规则
 
 1. 功能开发不进发布线。发布线只接收从开发线整理出来的快照，不合并开发历史、开发分支或实验 tag。
-2. 发行只从发布线出。版本 tag（如 `v0.4.7`）打在发布线的整理提交上，Release 的两个 EXE 必须由该 tag 的源码构建。
+2. 发行只从发布线出。版本 tag（如 `vX.Y.Z`）打在发布线的整理提交上，Release 的两个 EXE 必须由该 tag 的源码构建。
 3. 发布线保持最小历史。允许追加“整理快照”“流程文档”这类提交，但不允许出现开发过程的中间 commit。
 4. 发布前在干净工作副本重新构建 `tn_finds_vX.Y.Z-resampler.exe` 和 `tn_finds_vX.Y.Z-phrase.exe`，跑核心回归，再上传 Release。
 5. 发布线不放实验数据、benchmark、对比脚本、旧版本 EXE、哈希清单和历史修复文档。
 6. 切换 EXE 或工具组合后，清理宿主音符缓存。
 7. 不要直接在发布线改功能；先在开发线完成，再整理同步。
+8. 官方 Windows EXE 使用 OpenMoresampler 的 Nebula 后端构建，源码 commit 固定为 `15a4b85eaac4944a0a55cae50de96fb5a6f15344`；发布线源码默认仍可独立构建标准 F0 版。
 
 ## 发布检查
 
 - [ ] 源码来自发布线当前提交，工作区干净
 - [ ] 两个 EXE 版本号一致，`--version` 正确
+- [ ] 官方 EXE 的 `--report` 中 `f0_backend` 为 `nebula`
 - [ ] 核心回归通过
 - [ ] Release 附件与本机构建一致
 - [ ] tag、Release 说明、附件齐全

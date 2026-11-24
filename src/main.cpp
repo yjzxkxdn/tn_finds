@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "engine.hpp"
+#include "pitch.hpp"
 #include "wav.hpp"
 
 #ifndef TN_FINDS_DUAL_ROLE
@@ -27,7 +28,7 @@
 #include <vector>
 
 #ifndef TN_FINDS_VERSION
-#define TN_FINDS_VERSION "0.4.7"
+#define TN_FINDS_VERSION "0.4.8"
 #endif
 
 namespace {
@@ -168,7 +169,7 @@ bool known_after_me(std::string_view suffix) {
         else if (bare_flag(suffix.front())) suffix.remove_prefix(1);
         else break;
     }
-    if (suffix.empty() || suffix == "Tnr") return true;
+    if (suffix.empty() || suffix == "Tnr" || suffix == "Tns" || suffix == "Tnc") return true;
     // Reserve the other Moresampler names without implementing their effects.
     if (suffix == "Md" || suffix == "MC" || suffix == "MG" || suffix == "MD" || suffix == "Ms" || suffix == "Mm")
         return true;
@@ -220,6 +221,11 @@ void flags(std::string_view text, tn::Options& out) {
         }
         if (key == "Tnr") {
             out.mask_return = std::clamp(number(text.substr(begin, i - begin), "UTAU flag Tnr"), 0., 100.) / 100.;
+            continue;
+        }
+        if (key == "Tns" || key == "Tnc") {
+            const double amount = std::clamp(number(text.substr(begin, i - begin), "UTAU flag " + std::string(key)), 0., 100.);
+            (key == "Tnc" ? out.fixed_residual_mix : out.residual_mix) = amount;
             continue;
         }
         if (key.size() != 1) continue;
@@ -326,6 +332,8 @@ Job native(const Args& args) {
         {"--pitch-st", &tn::Options::pitch_st}, {"--target-hz", &tn::Options::target_hz},
         {"--formant-st", &tn::Options::formant_st}, {"--length-ms", &tn::Options::length_ms},
         {"--mask-return", &tn::Options::mask_return}, {"--harmonic-amount", &tn::Options::mask_return},
+        {"--residual-mix", &tn::Options::residual_mix},
+        {"--fixed-residual-mix", &tn::Options::fixed_residual_mix},
         {"--offset-ms", &tn::Options::offset_ms}, {"--consonant-ms", &tn::Options::consonant_ms},
         {"--cutoff-ms", &tn::Options::cutoff_ms}, {"--velocity", &tn::Options::velocity},
         {"--volume", &tn::Options::volume},
@@ -387,6 +395,7 @@ void print_help(std::ostream& stream) {
 Usage:
   tn_finds input output note velocity flags offset length consonant cutoff volume modulation [!tempo [pitchbend]]
   tn_finds --render input.wav output.wav [options]
+  tn_finds --estimate-f0 input.wav track.csv
   tn_finds --help | --version
 
 )";
@@ -410,6 +419,8 @@ An explicit --wavtool command uses ordinary PCM overlap-add.
                        Positive values raise the harmonic and breath envelopes.
   --mask-return N      Breath return from the five-cycle average, 0..1, default .75.
                        Classic Tnr divided by 100. --harmonic-amount is an alias.
+  --residual-mix N     Tns: replace post-fixed residual with spectral noise, 0..100 (default 0).
+  --fixed-residual-mix N  Tnc: same control for the OTO fixed region, 0..100 (default 0).
   --grain-formant      Use envelope-free grain warping instead of spectral gain.
   --phase-lock         Try source-relative harmonic phase on edited voiced grains.
   --f0 TRACK.csv       Source F0, header time_s,f0_hz; absolute input seconds, 0=no F0 hint.
@@ -420,8 +431,8 @@ An explicit --wavtool command uses ordinary PCM overlap-add.
   --velocity N        Consonant velocity, 100 leaves fixed region unchanged.
   --volume N          Output gain in percent, default 100.
   --tension N         Mt: change the LF glottal amplitude by remapping source Rd.
-  --breathiness N     Mb: scale recorded breath; positive values fade voiced harmonics.
-                      +100 leaves only residual in steady voiced regions; no added noise.
+  --breathiness N     Mb: scale breath; positive values fade voiced harmonics.
+                      +100 leaves only residual in steady voiced regions.
   --mouth N           Mo: spectral gain relative to target H1; positive sounds more open.
   --resonance N       Mr: boost or cut the band around 3 kHz.
   --formant-emphasis N  ME: sharpen or soften existing formants.
@@ -449,6 +460,8 @@ The standalone resampler writes PCM16. Recognized flags (others ignored):
   O[-100..100]        Voiced brightness.
   Tnr[0..100]         Amount of the breath mask returned to the residual. Default Tnr75.
                        Tnr0 uses the original average above the protected low band.
+  Tns[0..100]         0: sampled residual (default); 100: spectral noise after the fixed region.
+  Tnc[0..100]         Same control for the OTO fixed region. Tnc100Tns100 covers the whole note.
   WN                  Negative=unvoiced; 0 or (0,50)=off; 50..1000=forced Hz.
   e / e1 / Me / Me1   Linear stretching / prefer safe sustain loops; last wins.
                       e0 and Me0 keep the default mapping (OpenUtau option 0).
@@ -469,7 +482,8 @@ void print_report(const tn::Report& r) {
         << "{\"analysis_ms\":" << r.analysis_ms << ",\"synthesis_ms\":" << r.synthesis_ms
         << ",\"source_pitch_hz\":" << r.source_pitch_hz << ",\"input_samples\":" << r.input_samples
         << ",\"output_samples\":" << r.output_samples << ",\"islands\":" << r.islands
-        << ",\"bypass\":" << r.bypass << ",\"loop_used\":" << r.loop_used << '}';
+        << ",\"bypass\":" << r.bypass << ",\"loop_used\":" << r.loop_used
+        << ",\"f0_backend\":\"" << r.f0_backend << "\"}";
     std::cout << out.str() << '\n';
 }
 
@@ -484,6 +498,21 @@ int run(const Args& args) {
     }
     if (command == "--version" || command == "-V") {
         std::cout << "tn_finds " << TN_FINDS_VERSION << (TN_FINDS_DUAL_ROLE ? "-phrase\n" : "-resampler\n");
+        return 0;
+    }
+    if (command == "--estimate-f0") {
+        if (args.size() != 3) bad("--estimate-f0 requires input WAV and output CSV paths");
+        tn::wav::require_distinct(args[1], args[2]);
+        const auto audio = tn::wav::read(args[1]);
+        const auto track = tn::pitch::estimate_source(audio.samples, audio.sample_rate);
+        if (track.frames.empty()) throw std::runtime_error("F0 analysis produced no frames");
+        std::ofstream csv(args[2]);
+        csv.imbue(std::locale::classic());
+        csv << std::setprecision(17) << "time_s,f0_hz\n";
+        for (std::size_t i = 0; i < track.frames.size(); ++i)
+            csv << static_cast<double>(i)*track.step/audio.sample_rate << ',' << track.frames[i].hz << '\n';
+        csv.close();
+        if (!csv) throw std::runtime_error("could not write the F0 track");
         return 0;
     }
     const bool native_render = command == "--render";

@@ -19,9 +19,11 @@ struct Options {
     double opening = 0, dynamics = 0, volume = 100;
     bool loop = false, peak_normalize = false;
     bool grain_formant = false; // opt out of phase-preserving formant EQ
-    bool phase_lock = false;    // experimental source-relative harmonic phase transfer
+    bool phase_lock = false;    // optional source-relative harmonic phase transfer
     std::vector<F0Point> f0; // time of original (not trimmed) input; 0 Hz supplies no period hint
     double mask_return = default_mask_return; // 0..1, classic Tnr divided by 100
+    double residual_mix = 0.; // Tns: post-fixed spectral residual mix, percent
+    double fixed_residual_mix = 0.; // Tnc: fixed-region spectral residual mix, percent
     // Moresampler-style controls; all neutral at zero.
     double tension = 0, breathiness = 0, mouth = 0, resonance = 0, formant_emphasis = 0;
     bool force_loop = false; // prefer cycling even for short extensions
@@ -31,6 +33,7 @@ struct Report {
     double analysis_ms = 0, synthesis_ms = 0, source_pitch_hz = 0;
     std::size_t input_samples = 0, output_samples = 0, islands = 0;
     bool bypass = false, loop_used = false;
+    const char* f0_backend = "standard";
 };
 
 // Mono finite samples. Output uses input sample rate; no required external libraries.

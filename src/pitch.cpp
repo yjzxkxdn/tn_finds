@@ -495,6 +495,18 @@ Track estimate(const std::vector<float>& x, int sr) {
     return tr;
 }
 
+#ifdef TN_FINDS_NEBULA_F0
+Track estimate_nebula(const std::vector<float>& x, int sr);
+#endif
+
+Track estimate_source(const std::vector<float>& x, int sr) {
+#ifdef TN_FINDS_NEBULA_F0
+    return estimate_nebula(x, sr);
+#else
+    return estimate(x, sr);
+#endif
+}
+
 Track candidate_clock(const std::vector<float>& x, int sr, const Track& anchors, bool supplied) {
     Track tr = anchors;
     if (tr.frames.empty()) return tr;
@@ -554,6 +566,11 @@ Track candidate_clock(const std::vector<float>& x, int sr, const Track& anchors,
             if (f.hz > 0) prev = f.hz;
         }
     }
+    return bridge_clock(std::move(tr));
+}
+
+Track bridge_clock(Track tr) {
+    const auto n = tr.frames.size();
     // Bridge unsupported spans in log Hz, without claiming they are voiced.
     // A neutral clock gives even a fully unlabelled clip a trial hypothesis.
     for (std::size_t i = 0; i < n;) {

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
+# Direct MinGW build: standard F0. The official Nebula build uses CMake.
 [CmdletBinding()]
 param(
     [string]$Cxx = 'g++',
@@ -24,7 +25,7 @@ try {
         'src/harmonic_ridges.cpp', 'src/harmonic_synth.cpp')
     $builds = if ($Mode -eq 'Both') { 'Resampler', 'Phrase' } else { $Mode }
     foreach ($build in $builds) {
-        $name = if ($OutputName) { $OutputName } else { 'tn_finds_v0.4.7-' + $build.ToLowerInvariant() + '.exe' }
+        $name = if ($OutputName) { $OutputName } else { 'tn_finds_v0.4.8-' + $build.ToLowerInvariant() + '.exe' }
         $extra = if ($build -eq 'Phrase') {
             '-DTN_FINDS_DUAL_ROLE=1', 'src/wavtool.cpp', 'src/bat_host.cpp', 'src/phrase.cpp', 'src/phrase_io.cpp'
         } else { @() }

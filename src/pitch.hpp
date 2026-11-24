@@ -22,10 +22,16 @@ struct Island {
     std::vector<double> marks;  // same-phase fractional sample positions, not necessarily GCIs
 };
 
-// Mono audio, 8--192 kHz. The analysis searches 55--1300 Hz, in frames about
-// 5 ms apart. Invalid rates and empty input return an empty track. An input
-// shorter than the supporting span of a low note need not yield voiced F0.
+// Window-corrected autocorrelation; searches 55--1300 Hz on mono 8--192 kHz.
+// Invalid rates and empty input return an empty track.
 Track estimate(const std::vector<float>& x, int sr);
+
+// Automatic source F0. Nebula builds use its native source grid; other builds
+// call estimate().
+Track estimate_source(const std::vector<float>& x, int sr);
+
+// Continue a phase clock through unsupported spans with zero confidence.
+Track bridge_clock(Track track);
 
 // Build a continuous trial clock, not a voicing decision. Fill missing or
 // weak proposals using local low-band periodicity and neighboring anchors.

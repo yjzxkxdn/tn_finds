@@ -308,6 +308,16 @@ class TestAudio(unittest.TestCase):
         y, _, _ = self.native('--offset-ms', 25, '--cutoff-ms', 110)
         np.testing.assert_array_equal(x[1200:-5280], y)
 
+    def test_residual_mix_zero_is_a_noop_and_validates_range(self):
+        x = compound()
+        sf.write(self.inp, x, SR, subtype='FLOAT')
+        y, _, report = self.native('--residual-mix', 0, '--fixed-residual-mix', 0)
+        np.testing.assert_array_equal(x, y)
+        self.assertIn(report['f0_backend'], ('standard', 'nebula'))
+        for flag in ('--residual-mix', '--fixed-residual-mix'):
+            for value in (-1, 101):
+                self.cmd('--render', self.inp, self.out, flag, value, ok=False)
+
     def test_formant_only_leaves_clear_consonants_and_f0(self):
         x = compound()
         sf.write(self.inp, x, SR, subtype='FLOAT')

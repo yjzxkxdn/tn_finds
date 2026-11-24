@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "engine.hpp"
+#include "dsp_fft.hpp"
 #include "formant.hpp"
 #include "fractional_sinc.hpp"
 #include "glottal.hpp"
@@ -9,9 +10,12 @@
 #include "pitch.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <initializer_list>
+#include <random>
 #include <stdexcept>
 #include <utility>
 
@@ -34,36 +38,49 @@ double smooth(double x) {
 
 using detail::Sinc;
 
+int stretch_hop(int sr) { return std::max(1, static_cast<int>(std::lround(sr * .012))); }
+
 struct TimeMap {
     double ni, no, front_i, front_o, front_nominal;
+    int source_begin = 0;  // offset of the selected samples in the analysis buffer
     double loop_a = 0, loop_b = 0, loop_out = 0;
     int passes = 1;
+    bool hold_end = false;
     bool identity() const {
-        // A neutral-velocity fully fixed region may gain a silent tail without
-        // changing the clock of any sample that came from the source.
-        return (ni == no || (front_i == ni && no >= ni)) && front_i == front_nominal;
+        // An unpitched, fully fixed render can still be padded without
+        // changing the source clock. A pitched sustain holds the end model.
+        return !hold_end && (ni == no || (front_i == ni && no >= ni)) && front_i == front_nominal;
     }
     bool looping() const { return passes > 1; }
+    bool needs_sustain_guard(int hop) const {
+        const double tail = ni - front_i, duration = no - front_o;
+        // Keep the original end-support trigger and its analysis context.
+        // Residual replacement is controlled separately.
+        return hold_end || (tail > 0. && tail <= 4.*hop+2. && duration >= 4.*tail && duration-tail >= 2.*hop);
+    }
+    double front_source() const { return source_begin + front_i; }
+    int last_source() const { return source_begin + static_cast<int>(ni) - 1; }
     int active_samples() const {
-        return static_cast<int>(front_i == ni ? std::min(no, std::ceil(front_o)) : no);
+        return static_cast<int>(!hold_end && front_i == ni ? std::min(no, std::ceil(front_o)) : no);
     }
     double operator()(double z) const {
-        if (z < front_o && front_nominal > 0) return std::min(ni - 1, z * front_i / front_nominal);
-        if (identity()) return std::min(ni - 1, z);
+        const double last = last_source();
+        if (z < front_o && front_nominal > 0) return std::min(last, source_begin + z * front_i / front_nominal);
+        if (identity()) return std::min(last, source_begin + z);
         const double tail_i = ni - front_i, tail_o = no - front_o, u = z - front_o;
-        if (tail_i <= 0 || tail_o <= 0) return ni - 1;
+        if (tail_i <= 0 || tail_o <= 0) return last;
         double src;
         if (!looping()) {
-            src = front_i + u * tail_i / tail_o;
+            src = front_source() + u * tail_i / tail_o;
         } else {
-            const double intro = loop_a - front_i;
-            if (u < intro) return front_i + u;
-            if (u >= intro + loop_out) return std::min(ni - 1, loop_b + u - intro - loop_out);
+            const double intro = loop_a - front_source();
+            if (u < intro) return front_source() + u;
+            if (u >= intro + loop_out) return std::min(last, loop_b + u - intro - loop_out);
             const double width = loop_b - loop_a;
             const double phase = std::fmod((u - intro) * passes / loop_out, 2.);
             src = loop_a + width * (phase <= 1. ? phase : 2. - phase);
         }
-        return std::clamp(src, 0., ni - 1);
+        return std::clamp(src, double(source_begin), last);
     }
 };
 
@@ -79,9 +96,9 @@ void choose_loop(TimeMap& t, const std::vector<double>& marks, const detail::Har
         if (!stable(i)) { ++i; continue; }
         const auto start = i++;
         while (i < split.strength.size() && stable(i)) ++i;
-        const double lo = std::max({t.front_i + .006 * sr, marks.front() + .012 * sr,
+        const double lo = std::max({t.front_source() + .006 * sr, marks.front() + .012 * sr,
                                     start * split.hop + .012 * sr});
-        const double hi = std::min({t.ni - .010 * sr, marks.back() - .012 * sr,
+        const double hi = std::min({t.source_begin + t.ni - .010 * sr, marks.back() - .012 * sr,
                                     (i-1) * split.hop - .012 * sr});
         const double width = std::min({hi - lo, .160 * sr, extra * .49});
         if (width < (force ? .012 : .035) * sr) continue;
@@ -109,8 +126,27 @@ void choose_loop(TimeMap& t, const std::vector<double>& marks, const detail::Har
     }
 }
 
-pitch::Track source_track(const std::vector<float>& x, int sr, int start, const Options& o) {
-    if (o.f0.empty() && o.forced_hz == 0) return pitch::estimate(x, sr);
+pitch::Track source_track(const std::vector<float>& x, int sr, int start, const Options& o,
+                          const std::vector<float>& input) {
+    if (o.f0.empty() && o.forced_hz == 0) {
+#ifdef TN_FINDS_NEBULA_F0
+        // OpenMoresampler estimates on the complete recording. Rebase the
+        // resulting F0 to the OTO analysis buffer in source samples.
+        auto track = pitch::estimate_source(input, sr);
+        if (start == 0 && x.size() == input.size()) return track;
+        pitch::Track local;
+        local.step = track.step;
+        const std::size_t last = x.size()-1;
+        const std::size_t count = 1+(last+local.step-1)/local.step;
+        local.frames.reserve(count);
+        for (std::size_t i = 0; i < count; ++i)
+            local.frames.push_back(pitch::sample(track, start+std::min(i*local.step, last)));
+        return local;
+#else
+        (void)input;
+        return pitch::estimate(x, sr);
+#endif
+    }
     pitch::Track tr;
     tr.step = std::max(1, static_cast<int>(std::lround(sr * .0025)));
     const std::size_t count = (x.size() - 1 + tr.step - 1) / tr.step + 1;
@@ -137,19 +173,22 @@ pitch::Track source_track(const std::vector<float>& x, int sr, int start, const 
 
 double center_pitch(const pitch::Track& tr, const TimeMap& t) {
     std::vector<double> hz;
-    std::size_t prefix = static_cast<std::size_t>(t.front_i / tr.step);
-    for (std::size_t i = prefix; i < tr.frames.size(); ++i) {
+    std::size_t prefix = static_cast<std::size_t>(t.front_source() / tr.step);
+    const auto first = static_cast<std::size_t>(t.source_begin / tr.step);
+    const auto end = std::min(tr.frames.size(), std::size_t((t.last_source()+tr.step-1) / tr.step + 1));
+    for (std::size_t i = prefix; i < end; ++i) {
         if (tr.frames[i].hz > 0) hz.push_back(tr.frames[i].hz);
     }
     if (hz.empty()) {
-        for (const auto& f : tr.frames) if (f.hz > 0) hz.push_back(f.hz);
+        for (std::size_t i = first; i < end; ++i)
+            if (tr.frames[i].hz > 0) hz.push_back(tr.frames[i].hz);
     }
     if (hz.empty()) return 0;
     auto mid = hz.begin() + hz.size() / 2;
     std::nth_element(hz.begin(), mid, hz.end());
     const double median = *mid;
     double sum = 0, w = 0;
-    for (auto it = tr.frames.begin() + std::min(prefix, tr.frames.size()); it != tr.frames.end(); ++it) {
+    for (auto it = tr.frames.begin() + std::min(prefix, end); it != tr.frames.begin() + end; ++it) {
         if (it->hz <= 0) continue;
         const double d = std::log(it->hz / median);
         const double weight = std::max(.1, it->confidence) * std::exp(-d*d*20);
@@ -171,19 +210,19 @@ Warp stretch(const std::vector<float>& x, const detail::HarmonicSplit& split,
     if (map.identity()) return {x, h, correction};
     Warp wave{std::vector<float>(count), std::vector<float>(h.empty() ? 0 : count),
               std::vector<float>(correction.empty() ? 0 : count)};
-    if (count <= 1 || x.size() <= 1) {
-        std::fill(wave.dry.begin(), wave.dry.end(), x.front());
-        if (!h.empty()) std::fill(wave.harmonic.begin(), wave.harmonic.end(), h.front());
+    const int begin = map.source_begin, last = map.last_source();
+    if (count <= 1 || begin == last) {
+        std::fill_n(wave.dry.begin(), count, x[begin]);
+        if (!h.empty()) std::fill_n(wave.harmonic.begin(), count, h[begin]);
         if (!correction.empty())
-            std::fill(wave.residual_correction.begin(), wave.residual_correction.end(), correction.front());
+            std::fill_n(wave.residual_correction.begin(), count, correction[begin]);
         return wave;
     }
-    const int hop = std::max(1, static_cast<int>(std::lround(sr * .012)));
+    const int hop = stretch_hop(sr);
     const int search = std::max(1, static_cast<int>(std::lround(sr * .004)));
     const int stride = std::max(1, sr / 8000);
-    const int last = static_cast<int>(x.size()) - 1;
     const auto residual = [&](int at) {
-        const int p = std::clamp(at, 0, last);
+        const int p = std::clamp(at, begin, last);
         return double(x[p])-(h.empty() ? 0.f : h[p]);
     };
     std::vector<double> reference, candidates;
@@ -191,10 +230,10 @@ Warp stretch(const std::vector<float>& x, const detail::HarmonicSplit& split,
     // At velocity 100, no WSOLA overlap should reach back into the fixed
     // consonant: a sharp attack cannot move just because the vowel stretches.
     const int keep = map.front_i == map.front_nominal ? static_cast<int>(map.front_o) : 0;
-    std::copy_n(x.begin(), keep, wave.dry.begin());
-    if (!h.empty()) std::copy_n(h.begin(), keep, wave.harmonic.begin());
-    if (!correction.empty()) std::copy_n(correction.begin(), keep, wave.residual_correction.begin());
-    int a = keep;
+    std::copy_n(x.begin()+begin, keep, wave.dry.begin());
+    if (!h.empty()) std::copy_n(h.begin()+begin, keep, wave.harmonic.begin());
+    if (!correction.empty()) std::copy_n(correction.begin()+begin, keep, wave.residual_correction.begin());
+    int a = begin+keep;
     for (int i = keep; i < count; i += hop) {
         const int span = std::min(hop, count - i);
         const int want = static_cast<int>(std::lround(map(i + span)));
@@ -222,7 +261,7 @@ Warp stretch(const std::vector<float>& x, const detail::HarmonicSplit& split,
             for (std::size_t k = 0; k < candidates.size(); ++k)
                 candidates[k] = residual(want-span+stride/2+static_cast<int>(k)*stride);
             agreement = score(candidates.data());
-            if (periodic_share < .92 && want > search && want <= last-search) {
+            if (periodic_share < .92 && want > begin+search && want <= last-search) {
                 // Every trial is a view of the same strided residual. Read
                 // and clamp it once; the scoring and tie-breaking stay the same.
                 const int trials = 1+2*search/stride;
@@ -239,7 +278,7 @@ Warp stretch(const std::vector<float>& x, const detail::HarmonicSplit& split,
         }
         agreement = unit(agreement);
         for (int j = 0; j < span; ++j) {
-            const int p = std::clamp(a + j, 0, last), q = std::clamp(b + j - span, 0, last);
+            const int p = std::clamp(a + j, begin, last), q = std::clamp(b + j - span, begin, last);
             const double w = smooth(j / static_cast<double>(span)), v = 1. - w;
             const double gain = p == q ? 1. : 1. / std::sqrt(v*v + w*w + 2*agreement*v*w);
             wave.dry[i + j] = static_cast<float>((x[p] * v + x[q] * w) * gain);
@@ -251,6 +290,334 @@ Warp stretch(const std::vector<float>& x, const detail::HarmonicSplit& split,
     }
     return wave;
 }
+
+// The spectral windows give consonants their color but can spread a short
+// unvoiced attack into nearby silence. Follow the original short-time level
+// in the fixed region without importing its waveform or boosting voiced leakage.
+template<class Residual>
+void follow_consonant_envelope(std::vector<float>& noise, const Residual& sample,
+                               const detail::HarmonicSplit& split, const TimeMap& map, int edge, int sr) {
+    const int hop = std::max(1, static_cast<int>(std::lround(sr*.0015)));
+    const auto level = [&](const auto& read, int at, int first, int last) {
+        const int a = std::max(first, at-hop), b = std::min(last, at+hop+1);
+        double sum = 0., energy = 0.;
+        for (int i = a; i < b; ++i) {
+            const double v = read(i);
+            sum += v;
+            energy += v*v;
+        }
+        const double mean = sum/(b-a);
+        return std::sqrt(std::max(0., energy/(b-a)-mean*mean));
+    };
+    const auto read_noise = [&](int i) { return noise[i]; };
+    const int frames = (edge+hop-1)/hop;
+    std::vector<double> gains(frames+1, 1.);
+    for (int j = 0; j < frames; ++j) {
+        const int output = j*hop;
+        const int source = static_cast<int>(std::lround(map(output)));
+        const double uv = 1.-smooth((split.activity(source)-.10)/.25);
+        if (uv <= 0.) continue;
+        const double measured = level(sample, source, map.source_begin, map.last_source()+1);
+        const double generated = level(read_noise, output, 0, edge);
+        if (generated < 1.e-12) continue;
+        const double ratio = measured/generated;
+        // Leave stationary texture alone within a small tolerance. Boost
+        // only short, measured unvoiced events, not missing high harmonics.
+        const double g = ratio < .77 ? std::min(1., 1.30*ratio) : std::clamp(ratio/1.30, 1., 2.2);
+        gains[j] = mix(1., g, uv*smooth((edge-output)/double(2*hop)));
+    }
+    for (int j = 0; j < frames; ++j) {
+        const int a = j*hop, b = std::min(edge, a+hop);
+        for (int i = a; i < b; ++i)
+            noise[i] *= static_cast<float>(mix(gains[j], gains[j+1], smooth(double(i-a)/(b-a))));
+    }
+}
+
+// Generate independent noise from a time-varying spectrum at the mapped
+// source position, without stretching or repeating the recorded waveform.
+std::vector<float> synthesize_residual(const std::vector<float>& x, const detail::HarmonicSplit& split,
+                                      const std::vector<float>& correction, const pitch::Track& clock,
+                                      const TimeMap& map, int sr, int first, int edge, int stop, int count,
+                                      bool follow_fixed_envelope) {
+    const auto& harmonic = split.harmonic;
+    const auto residual = [&](int i) {
+        return (x[i] - (harmonic.empty() ? 0.f : harmonic[i])) - (correction.empty() ? 0.f : correction[i]);
+    };
+    const int n = std::clamp(1 << static_cast<int>(std::lround(std::log2(sr*.046))), 256, 8192);
+    const int half = n/2, radius = std::min(half, static_cast<int>(std::lround(sr*.016)));
+    const double df = double(sr)/n;
+    const double left = std::min(map.front_source(), double(map.last_source()));
+    const double width = map.last_source()-left;
+    const double fixed_width = left-map.source_begin;
+    const int fixed_frames = static_cast<int>(std::ceil(fixed_width/(sr*.006)));
+    const int tail_frames = std::max(1, static_cast<int>(std::ceil(width/(sr*.006))));
+    const int intervals = fixed_frames+tail_frames;
+    const int input_size = static_cast<int>(x.size());
+    const int join_center = static_cast<int>(std::lround(left))-radius;
+    const double join_weight = join_center >= map.source_begin && split.activity(join_center) > .25
+        ? 1.-smooth(width/radius) : 0.;
+    const detail::Fft fft(n);
+    std::vector<detail::Complex> spec(n);
+    std::vector<float> window(2*radius+1), smoothed(half+1);
+    std::vector<double> sum(half+1);
+    struct PowerFrame { int index = -1; std::vector<float> power; };
+    std::array<PowerFrame, 4> powers;
+    for (int j = 0; j <= 2*radius; ++j)
+        window[j] = static_cast<float>(.5-.5*std::cos(pi*j/radius));
+    const auto smooth_power = [&](std::vector<float>& power, int bins) {
+        sum[0] = 0.;
+        for (int k = 1; k <= half; ++k) sum[k] = sum[k-1]+power[k];
+        for (int k = 1; k <= half; ++k) {
+            const int a = std::max(1, k-bins), b = std::min(half, k+bins);
+            smoothed[k] = static_cast<float>((sum[b]-sum[a-1])/(b-a+1));
+        }
+        power.swap(smoothed);
+    };
+    // Cache frames on demand; replacement may cover any source length.
+    const auto power_at = [&](int frame) -> const std::vector<float>& {
+        auto& cached = powers[frame % powers.size()];
+        auto& power = cached.power;
+        if (cached.index == frame) return power;
+        cached.index = frame;
+        power.assign(half+1, 0.f);
+        const double position = frame < fixed_frames
+            ? map.source_begin+fixed_width*frame/fixed_frames
+            : left+width*(frame-fixed_frames)/tail_frames;
+        const int center = static_cast<int>(std::lround(position));
+        // Use a one-sided window at a voiced cutoff if the inner part is
+        // still voiced. It avoids estimating aspiration from the last,
+        // least well separated pulse while keeping UV transitions local.
+        const int inner = std::max(0, center-radius/2);
+        const bool inner_voice = split.activity(center) > .25 && split.activity(inner) > .25;
+        int analysis = inner_voice ? std::max(inner, std::min(center, input_size-1-radius/2)) : center;
+        if (inner_voice && join_weight > 0.) {
+            // With less than half a window of stable vowel left, trust the
+            // complete window just before the join more than a truncated
+            // last cycle. Do not pull a genuine UV transition back in time.
+            const double blend = join_weight*smooth((center-join_center)/double(radius));
+            analysis = static_cast<int>(std::lround(mix(analysis, std::min(analysis, join_center), blend)));
+        }
+        const int start = analysis-radius;
+        const int begin = std::max(0, -start), end = std::min(2*radius, input_size-start);
+        const auto frame_pitch = pitch::sample(clock, analysis);
+        const double hz = frame_pitch.hz;
+        const bool voiced = split.activity(analysis) > .20 && hz > 0.;
+        // At an actual cutoff the separator has fewer right-hand periods;
+        // the residual can contain a stronger copy of the vowel. Estimate
+        // the noise floor beside each partial before smoothing the envelope.
+        const auto apodize = [&](int j) {
+            // For a truncated half window, taper the new edge instead of
+            // transforming a hard join to the padding as broadband noise.
+            const double edge = std::max(1, radius/4);
+            return window[j]*smooth((end-j-1)/edge)*smooth((j-begin)/edge);
+        };
+        double energy = 0., weight = 0., average = 0.;
+        for (int j = begin; j < end; ++j) {
+            const double w = apodize(j);
+            energy += w*w;
+            weight += w;
+            average += w*residual(start+j);
+        }
+        if (energy <= 1.e-12) return power;
+        average /= weight;
+        std::fill(spec.begin(), spec.end(), detail::Complex{});
+        for (int j = begin; j < end; ++j)
+            spec[j] = {static_cast<float>(apodize(j)*(residual(start+j)-average)), 0.f};
+        fft.run(spec);
+        // Average out the harmonic comb of any leakage in the separation;
+        // preserve broad breath/frication bands, not peaks at the old F0.
+        const int bins = std::clamp(static_cast<int>(std::lround(std::max(170., .6*hz)/df)), 1, half-1);
+        for (int k = 1; k <= half; ++k) power[k] = static_cast<float>(std::norm(spec[k])/energy);
+        if (voiced) {
+            // Bound the lower-band peaks by power halfway between adjacent
+            // source harmonics. This affects noise estimation only, never H.
+            const int limit = std::min(half, static_cast<int>(3000./df));
+            for (int k = 1; k <= limit; ++k) {
+                const double order = k*df/hz;
+                const double left_skirt = std::floor(order-.5)+.5;
+                const auto bin = [&](double at) {
+                    return std::clamp(static_cast<int>(std::lround(at*hz/df)), 1, half);
+                };
+                const double floor = mix(power[bin(left_skirt)], power[bin(left_skirt+1.)], order-left_skirt);
+                smoothed[k] = std::min(power[k], static_cast<float>(1.5*floor));
+            }
+            std::copy_n(smoothed.begin()+1, limit, power.begin()+1);
+        }
+        smooth_power(power, bins);
+        smooth_power(power, bins);
+        for (int k = 1; k <= half; ++k) power[k] *= static_cast<float>(smooth((k*df-45.)/75.));
+        return power;
+    };
+
+    std::uint32_t seed = static_cast<std::uint32_t>(count) ^ (static_cast<std::uint32_t>(edge)*16777619u);
+    const int stride = std::max(1, (map.last_source()-map.source_begin)/64);
+    for (int i = map.source_begin; i <= map.last_source(); i += stride)
+        seed = (seed ^ static_cast<std::uint32_t>(std::lround(x[i]*32768.)))*16777619u;
+    std::mt19937 fixed_random(seed ^ 0x9e3779b9u), tail_random(seed);
+    detail::RealInverseFft inverse(n);
+    std::vector<detail::Complex> excitation(half+1);
+    std::vector<float> noise(stop-first), block, bell(n);
+    for (int j = 0; j < n; ++j) bell[j] = static_cast<float>(std::sin(pi*j/n));
+    // Use the same grid, overlap and excitation past the boundary whether
+    // or not the optional fixed-region noise was needed before it.
+    const int origin = edge-(edge-first+half-1)/half*half;
+    for (int center = origin; center-half < stop; center += half) {
+        auto& random = center < edge ? fixed_random : tail_random;
+        const auto draw = [&] { return static_cast<float>(random() >> 8)*(2.f/16777216.f)-1.f; };
+        const double source = map(center);
+        const double at = fixed_frames > 0 && source < left
+            ? fixed_frames*unit((source-map.source_begin)/fixed_width)
+            : fixed_frames+(width > 0. ? tail_frames*unit((source-left)/width) : 0.);
+        const int i = std::min(intervals-1, static_cast<int>(at));
+        const double frac = at-i;
+        const auto& a = power_at(i);
+        const auto& b = power_at(i+1);
+        for (int k = 1; k < half; ++k) {
+            // Each uniform component has variance 1/3: E[|X[k]|²] = n * PSD.
+            const float gain = static_cast<float>(std::sqrt(1.5*n*mix(a[k], b[k], frac)));
+            const float real = draw(), imag = draw();
+            excitation[k] = detail::Complex(real, imag)*gain;
+        }
+        inverse.run(excitation, block, 1.f/n);
+        const int start = center-half;
+        // Independent blocks use equal-power overlap. A unit-sum amplitude
+        // window would audibly modulate the noise at the synthesis hop.
+        for (int j = std::max(0, first-start); j < std::min(n, stop-start); ++j)
+            noise[start+j-first] += bell[j]*block[j];
+    }
+    if (follow_fixed_envelope && edge > 0)
+        follow_consonant_envelope(noise, residual, split, map, edge, sr);
+    return noise;
+}
+
+struct ResidualMix {
+    int edge, first, stop, join_start, join_end;
+    double fixed, tail;
+    bool follow_fixed_envelope;
+
+    ResidualMix(const TimeMap& map, int sr, int count, const Options& o)
+        : edge(std::min(count, static_cast<int>(std::ceil(map.front_o)))),
+          first(o.fixed_residual_mix > 0. && edge > 0 ? 0 : edge), stop(edge),
+          join_start(edge), join_end(edge),
+          fixed(edge > 0 ? o.fixed_residual_mix/100. : o.residual_mix/100.),
+          tail(edge < count ? o.residual_mix/100. : fixed),
+          follow_fixed_envelope(o.fixed_residual_mix > 0.) {
+        const double source_tail = map.ni-map.front_i;
+        const bool short_join = tail > 0. && !map.identity() && source_tail <= stretch_hop(sr);
+        if (edge > 0 && edge < count) {
+            if (short_join && tail > fixed) {
+                // Near a cutoff, the last fixed cycles can still leak into
+                // the residual. Hand off before those cycles reach the join.
+                // In particular a fully synthetic tail never reads WSOLA
+                // from either side of the cutoff after the OTO boundary.
+                const int width = static_cast<int>(std::lround(sr*.016));
+                join_start = edge-std::min(width, std::max(1, edge/2));
+                first = std::min(first, join_start);
+            } else if (fixed != tail || (short_join && fixed < 1.)) {
+                join_end += std::min(count-edge, static_cast<int>(std::lround(sr*.006)));
+            }
+        }
+        stop = tail > 0. ? count : join_end;
+    }
+    bool enabled() const { return first < stop; }
+    double transition(int n) const {
+        if (n < join_start) return 0.;
+        if (n >= join_end) return 1.;
+        return smooth(double(n-join_start)/(join_end-join_start));
+    }
+};
+
+// The unwarped source spectrum sets the noise level. Keep the old WSOLA
+// branch from overpowering it, including a nonzero cutoff plateau, but
+// never use a repeated fragment as gain reference for the generated noise.
+void mix_residual(std::vector<float>& noise, const Warp& wave, const ResidualMix& edit, int sr) {
+    const auto recorded = [&](int at) {
+        const float h = wave.harmonic.empty() ? 0.f : wave.harmonic[at];
+        const float removed = wave.residual_correction.empty() ? 0.f : wave.residual_correction[at];
+        return (wave.dry[at]-h)-removed;
+    };
+    const int tail_count = edit.stop-edit.edge;
+    const int span = std::max(1, static_cast<int>(std::lround(.046*sr)));
+    const int frames = edit.tail > 0. && edit.tail < 1. ? (tail_count+span-1)/span : 0;
+    const auto end = [&](int i) { return std::min(tail_count, (i+1)*span); };
+    const auto center = [&](int i) { return .5*(i*span+end(i)-1); };
+    std::vector<double> gains(frames);
+    for (int i = 0; i < frames; ++i) {
+        double old_energy = 0., new_energy = 0.;
+        for (int j = i*span; j < end(i); ++j) {
+            const int at = edit.edge+j;
+            const double d = recorded(at), r = noise[at-edit.first];
+            old_energy += d*d;
+            new_energy += r*r;
+        }
+        // Half a dB of headroom avoids chasing random short-window variance.
+        gains[i] = std::sqrt(unit(1.122*new_energy/std::max(1.e-24, old_energy)));
+    }
+    const double trim = smooth(2.*edit.tail);
+    const double fixed_dry = std::sqrt(1.-edit.fixed), fixed_noise = std::sqrt(edit.fixed);
+    const double tail_dry = std::sqrt(1.-edit.tail), tail_noise = std::sqrt(edit.tail);
+    const double fixed_angle = std::asin(fixed_noise), tail_angle = std::asin(tail_noise);
+    int frame = 0;
+    for (int n = edit.first; n < edit.stop; ++n) {
+        const int j = n-edit.edge;
+        float& generated = noise[n-edit.first];
+        const double w = edit.transition(n);
+        if (w == 0.) {
+            if (edit.fixed < 1.) generated = static_cast<float>(fixed_dry*recorded(n) + fixed_noise*generated);
+            continue;
+        }
+        if (w == 1. && edit.tail >= 1.) continue;
+        double gain = 1.;
+        if (frames > 0) {
+            while (frame+1 < frames && j >= center(frame+1)) ++frame;
+            gain = gains[frame];
+            if (frame+1 < frames && j > center(frame)) {
+                const double u = (j-center(frame))/(center(frame+1)-center(frame));
+                gain = mix(gain, gains[frame+1], smooth(u));
+            }
+            gain = mix(1., gain, trim*w);
+        }
+        double sampled_weight = tail_dry, generated_weight = tail_noise;
+        if (w < 1. && edit.fixed != edit.tail) {
+            // Both equal-power weights have zero slope at the endpoints.
+            const double angle = mix(fixed_angle, tail_angle, w);
+            sampled_weight = std::cos(angle);
+            generated_weight = std::sin(angle);
+        }
+        generated = static_cast<float>(sampled_weight*gain*recorded(n) + generated_weight*generated);
+    }
+}
+
+// Hold a supported *interior* cycle model if the source cursor approaches a
+// hard cutoff. Do not move the target F0 lookup, the OTO cursor or a UV exit.
+// With less than one period to the last mark, either pulse window would
+// otherwise read zero padding for part of the cycle throughout the sustain.
+class SustainSource {
+    const TimeMap& time_;
+    double edge_ = 0., limit_ = 0.;
+public:
+    SustainSource(const TimeMap& time, const std::vector<double>& marks,
+                  const detail::HarmonicSplit& split, int sr, bool guard) : time_(time) {
+        if (!guard || marks.size() < 3) return;
+        const double end = time.last_source();
+        const double period = marks.back()-marks[marks.size()-2];
+        const double limit = std::min(marks[marks.size()-2], end-period-.5*split.hop);
+        const double probe = std::max(period, .006*sr);
+        if (limit < time.source_begin || end-limit > 3.*probe ||
+            split.activity(end) < .24 || split.activity(limit) < .26 ||
+            split.activity(.5*(limit+end)) < .24) return;
+        limit_ = limit;
+        edge_ = .5*std::min(probe, end-limit);
+    }
+
+    double operator()(double n) const {
+        const double at = time_(n);
+        if (edge_ <= 0. || at <= limit_-edge_) return at;
+        const double u = unit((at-limit_+edge_)/(2.*edge_));
+        const double safe = limit_-edge_*(1.-u)*(1.-u);
+        return mix(at, safe, smooth((n-time_.front_o+2.*edge_)/(2.*edge_)));
+    }
+};
 
 struct Grain {
     double center, a, b, mix_ab, period_l, period_r;
@@ -425,11 +792,14 @@ pitch::Track output_track(const pitch::Track& source, const TimeMap& time, const
     return track;
 }
 
-void gain_stage(std::vector<float>& y, const Options& o) {
+void gain_stage(std::vector<float>& y, const Options& o, double reference_peak = -1.) {
     double gain = o.volume / 100.;
     if (o.peak_normalize) {
-        float peak = 0;
-        for (float v : y) peak = std::max(peak, std::abs(v));
+        double peak = reference_peak;
+        if (peak < 0.) {
+            peak = 0.;
+            for (float v : y) peak = std::max(peak, double(std::abs(v)));
+        }
         if (peak > 0) gain *= .5 / peak;
     }
     if (gain != 1) for (float& v : y) v = static_cast<float>(v * gain);
@@ -440,7 +810,7 @@ void validate(const std::vector<float>& input, int sr, const Options& o) {
         throw std::invalid_argument("expected 1..16000000 samples at 8..192 kHz");
     for (double v : {o.offset_ms, o.cutoff_ms, o.length_ms, o.consonant_ms, o.velocity,
                      o.target_hz, o.pitch_st, o.modulation, o.tempo, o.formant_st, o.forced_hz,
-                     o.consonant_boost, o.opening, o.dynamics, o.volume, o.mask_return,
+                     o.consonant_boost, o.opening, o.dynamics, o.volume, o.mask_return, o.residual_mix, o.fixed_residual_mix,
                      o.tension, o.breathiness, o.mouth, o.resonance, o.formant_emphasis})
         if (!std::isfinite(v)) throw std::invalid_argument("non-finite option");
     if (o.offset_ms < 0 || o.consonant_ms < 0 || (o.length_ms < 0 && o.length_ms != -1) ||
@@ -455,6 +825,8 @@ void validate(const std::vector<float>& input, int sr, const Options& o) {
         throw std::invalid_argument("option outside supported range");
     if (o.mask_return < 0. || o.mask_return > 1.)
         throw std::invalid_argument("mask return must be 0..1");
+    if (o.residual_mix < 0. || o.residual_mix > 100. || o.fixed_residual_mix < 0. || o.fixed_residual_mix > 100.)
+        throw std::invalid_argument("residual mixes must be 0..100");
     for (double v : {o.tension, o.breathiness, o.mouth, o.resonance, o.formant_emphasis})
         if (std::abs(v) > 100.) throw std::invalid_argument("voice effect must be -100..100");
     for (float v : input) if (!std::isfinite(v) || std::abs(v) > 64.f)
@@ -475,6 +847,9 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
     validate(input, sr, o);
     Report result;
     result.input_samples = input.size();
+#ifdef TN_FINDS_NEBULA_F0
+    result.f0_backend = "nebula";
+#endif
     const double ms = sr / 1000.;
     const double ni = static_cast<double>(input.size());
     const double start = std::round(std::min(ni, o.offset_ms * ms));
@@ -484,20 +859,31 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
     const double nout = o.length_ms == -1 ? end - start : std::round(o.length_ms * ms);
     if (nout < 1 || nout > max_samples) throw std::invalid_argument("output length is outside 1..16000000 samples");
     const int count = static_cast<int>(nout);
-    const int first = static_cast<int>(start);
+    const int first = static_cast<int>(start), last = static_cast<int>(end);
     result.output_samples = count;
-    std::vector<float> x(input.begin() + first, input.begin() + static_cast<int>(end));
     const double front = std::min(o.consonant_ms * ms, end - start);
     const double fixed_out = front * std::exp2(1. - o.velocity / 100.);
     TimeMap time{end - start, nout, front, std::min(nout, fixed_out), fixed_out};
     const bool bend = std::any_of(o.bends.begin(), o.bends.end(), [](int v) { return v != 0; });
     const bool untouched_pitch = o.target_hz == 0 && o.pitch_st == 0 && !bend;
+    const int hop = stretch_hop(sr);
+    time.hold_end = !untouched_pitch && time.ni-front <= 1. && nout - time.front_o >= 2.*hop;
+    const bool sustain_guard = time.needs_sustain_guard(hop);
+    const int active = time.active_samples();
+    const ResidualMix residual_mix(time, sr, active, o);
+    const bool replace_residual = residual_mix.enabled();
+    // A cut can leave fewer than two periods at the offset. Use preceding
+    // context for analysis, but never let the next syllable supply the tail.
+    const int context = sustain_guard ? static_cast<int>(std::lround(.050*sr)) : 0;
+    const int analysis_first = std::max(0, first-context);
+    time.source_begin = first-analysis_first;
+    std::vector<float> x(input.begin()+analysis_first, input.begin()+last);
     const bool color_residual = o.mouth != 0. || o.resonance != 0. || o.formant_emphasis != 0.;
     const bool color_harmonic = color_residual || o.tension != 0.;
     const bool no_voice_effects = o.formant_st == 0 && o.opening == 0 && o.dynamics == 0 &&
                                   !color_harmonic && o.breathiness == 0.;
     const bool unchanged_clock = !model && time.identity() && untouched_pitch;
-    if (unchanged_clock && no_voice_effects && o.consonant_boost == 0) {
+    if (unchanged_clock && no_voice_effects && o.consonant_boost == 0 && !replace_residual) {
         const auto ts = Clock::now();
         pad_tail(x, count, sr);
         gain_stage(x, o);
@@ -517,9 +903,14 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
     std::vector<pitch::Island> support;
     detail::HarmonicSplit split;
     if (o.forced_hz >= 0.) {
-        const auto anchors = source_track(x, sr, first, o);
+        const auto anchors = source_track(x, sr, analysis_first, o, input);
         const bool supplied = !o.f0.empty() || o.forced_hz > 0.;
+#ifdef TN_FINDS_NEBULA_F0
+        // The model has already selected voiced frames and their frequencies.
+        clock = supplied ? pitch::candidate_clock(x, sr, anchors, true) : pitch::bridge_clock(anchors);
+#else
         clock = pitch::candidate_clock(x, sr, anchors, supplied);
+#endif
         support = pitch::locate(x, sr, clock);
         if (!support.empty())
             split = detail::split_harmonic(x, sr, support.front().marks, clock, resynthesize,
@@ -547,7 +938,6 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
     result.loop_used = time.looping();
     result.analysis_ms = milliseconds(ts);
     ts = Clock::now();
-    const int active = time.active_samples();
     if (model) {
         model->sample_rate = sr;
         model->active = active;
@@ -571,7 +961,22 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
             correction[i] = removed - voiced * (correction[i] - original(i));
         }
     }
-    auto wave = stretch(x, split, correction.empty() ? split.cleanup : correction, time, sr, active);
+    const auto& dry_correction = correction.empty() ? split.cleanup : correction;
+    auto wave = stretch(x, split, dry_correction, time, sr, active);
+    std::vector<float> mixed;
+    if (replace_residual) {
+        mixed = synthesize_residual(x, split, dry_correction, clock, time, sr, residual_mix.first,
+                                    residual_mix.edge, residual_mix.stop, active,
+                                    residual_mix.follow_fixed_envelope);
+        mix_residual(mixed, wave, residual_mix, sr);
+    }
+    // Anchor the existing normalization to Tns0 so a different noise
+    // crest factor never changes the gain on the harmonics or attack.
+    const bool anchor_peak = replace_residual && o.peak_normalize;
+    double recorded_peak = 0.;
+    const auto measure = [&](float v) {
+        if (anchor_peak) recorded_peak = std::max(recorded_peak, double(std::abs(v)));
+    };
     auto& y = wave.dry;
     const double boost = 5. * std::pow(o.consonant_boost / 100., 2.);
     if (!h.empty()) {
@@ -588,6 +993,7 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
         }
         const auto& source = spectral_formant ? shaped : h;
         const auto& is = support.front();
+        const SustainSource sustain_source(time, is.marks, split, sr, sustain_guard);
         detail::TargetClock target;
         const auto grains = target_grains(active, time, is, clock, o, result.source_pitch_hz, sr,
                                           unchanged_clock, target);
@@ -602,7 +1008,7 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
                     const auto right = std::min(j+1, grains.size()-1);
                     const double at = grains[j].center;
                     const double hz = sr*double(right-left)/(grains[right].center-grains[left].center);
-                    epochs.push_back({at, time(std::clamp(at, 0., double(active))), hz});
+                    epochs.push_back({at, sustain_source(std::clamp(at, 0., double(active))), hz});
                 }
                 const detail::PhaseReference reference{h, source_rd, formant_ratio};
                 if (model) {
@@ -645,7 +1051,7 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
                 dst.reserve(grains.size()); at.reserve(grains.size());
                 for (const auto& g : grains) {
                     dst.push_back(g.center);
-                    at.push_back(time(g.center));
+                    at.push_back(sustain_source(g.center));
                 }
                 detail::lock_harmonic_phase(source, is.marks, dst, at, sr, 0, periodic_out);
             }
@@ -674,12 +1080,12 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
             mapped_rd.hop = effect_clock.step;
             mapped_rd.rd.resize(effect_clock.frames.size());
             for (std::size_t i = 0; i < mapped_rd.rd.size(); ++i)
-                mapped_rd.rd[i] = source_rd.sample(time(std::min(double(i)*mapped_rd.hop, double(active))));
+                mapped_rd.rd[i] = source_rd.sample(sustain_source(std::min(double(i)*mapped_rd.hop, double(active))));
         }
-        std::vector<float> colored_wet, colored_dry;
+        std::vector<float> colored_wet, colored_dry, colored_mixed;
         if (model) {
             for (std::size_t j = 0; j < model->frames.size(); ++j) {
-                const double pos = time(std::min(double(active), double(j*model->hop)));
+                const double pos = sustain_source(std::min(double(active), double(j*model->hop)));
                 detail::color_harmonics(model->frames[j], sr, o, source_rd.sample(pos),
                                         smooth(split.activity(pos)/.30), level_hz);
             }
@@ -694,47 +1100,79 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
                 const float removed = wave.residual_correction.empty() ? 0.f : wave.residual_correction[n];
                 colored_dry[n] = (y[n]-wave.harmonic[n])-removed;
             }
+            if (replace_residual) {
+                colored_mixed = colored_dry;
+                std::copy(mixed.begin(), mixed.end(), colored_mixed.begin()+residual_mix.first);
+                detail::shape_voice_envelope(colored_mixed, sr, effect_clock, o, false);
+            }
             detail::shape_voice_envelope(colored_dry, sr, effect_clock, o, false);
         }
+        const int color_fade = std::min(static_cast<int>(std::lround(sr*.006)),
+                                        residual_mix.join_end-residual_mix.join_start);
         float lp = 0;
         std::size_t g = 0;
         for (int n = 0; n < active; ++n) {
             const float base = wave.harmonic[n];
             const float residue = y[n]-base;
             const float removed = wave.residual_correction.empty() ? 0.f : wave.residual_correction[n];
+            const bool use_mixed = n >= residual_mix.first && n < residual_mix.stop;
+            const float alternate = use_mixed ? mixed[n-residual_mix.first] : 0.f;
+            const auto color = [&](float& dry, float& edited, float amount) {
+                const float dry_delta = colored_dry[n]-dry;
+                dry += amount*dry_delta;
+                if (!use_mixed) return;
+                // Spectral EQ windows can see the splice before its first
+                // sample. Bring their correction in and out continuously too.
+                double weight = 1.;
+                if (color_fade > 0) {
+                    if (residual_mix.first > 0)
+                        weight *= smooth(double(n-residual_mix.first)/color_fade);
+                    if (residual_mix.stop < active)
+                        weight *= smooth(double(residual_mix.stop-n)/color_fade);
+                }
+                edited += amount*static_cast<float>(mix(dry_delta, colored_mixed[n]-edited, weight));
+            };
             if (model) {
-                float dry = residue-removed;
+                float dry = residue-removed, edited = alternate;
                 if (color_residual || breath_gain != 1. || boost > 0.) {
                     const double pos = time(n);
                     const double voice_mix = smooth(split.activity(pos)/.30);
-                    if (color_residual) dry += static_cast<float>(voice_mix)*(colored_dry[n]-dry);
-                    dry *= static_cast<float>((1.+(breath_gain-1.)*voice_mix)*(1.+(1.-split.share(pos))*boost));
+                    if (color_residual) color(dry, edited, static_cast<float>(voice_mix));
+                    const float gain = static_cast<float>((1.+(breath_gain-1.)*voice_mix)*(1.+(1.-split.share(pos))*boost));
+                    dry *= gain;
+                    edited *= gain;
                 }
-                y[n] = dry;
+                measure(dry);
+                y[n] = use_mixed ? edited : dry;
                 continue;
             }
             const float wet = wet_wave[n];
             if (!effects) {
-                y[n] += (wet-base)-removed;
+                const float reference = y[n] + ((wet-base)-removed);
+                measure(reference);
+                y[n] = use_mixed ? wet + alternate : reference;
                 continue;
             }
             const double pos = time(n);
             const float activity = static_cast<float>(split.activity(pos));
-            float dry = residue - removed;
+            float dry = residue - removed, edited = alternate;
             float voiced = wet;
             const double voice_mix = edit_voice ? smooth(activity / .30) : 0.;
             if (color_harmonic && voice_mix > 0.) {
                 const float gain = static_cast<float>(voice_mix);
                 voiced += gain*(colored_wet[n]-voiced);
-                if (color_residual) dry += gain*(colored_dry[n]-dry);
+                if (color_residual) color(dry, edited, gain);
             }
             if (shelf_gain != 0.) {
                 lp += shelf_k * (wet-lp);
                 voiced += static_cast<float>(shelf_gain) * (wet-lp);
             }
-            // Scale only the voiced part of the recorded residual.
-            if (breath_gain != 1.)
-                dry *= static_cast<float>(1. + (breath_gain - 1.) * voice_mix);
+            // Mb scales the voiced part after the residual source is chosen.
+            if (breath_gain != 1.) {
+                const float gain = static_cast<float>(1. + (breath_gain - 1.) * voice_mix);
+                dry *= gain;
+                edited *= gain;
+            }
             if (o.dynamics != 0. && level_hz > 0. && grains.size() >= 2) {
                 while (g+2 < grains.size() && n >= grains[g+1].center) ++g;
                 const double hz = sr/(grains[g+1].center-grains[g].center);
@@ -742,7 +1180,16 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
                     std::clamp(std::log2(hz / level_hz) * 4., -1., 1.));
             }
             if (whisper > 0.) voiced *= static_cast<float>(1. - whisper * voice_mix);
-            y[n] = voiced + dry * static_cast<float>(1. + (1. - split.share(pos)) * boost);
+            const float gain = static_cast<float>(1. + (1. - split.share(pos)) * boost);
+            measure(voiced + dry*gain);
+            y[n] = voiced + (use_mixed ? edited : dry)*gain;
+        }
+    } else if (replace_residual) {
+        const float gain = static_cast<float>(1. + boost);
+        for (int n = 0; n < active; ++n) {
+            measure(y[n]*gain);
+            const bool use_mixed = n >= residual_mix.first && n < residual_mix.stop;
+            y[n] = (use_mixed ? mixed[n-residual_mix.first] : y[n])*gain;
         }
     } else if (boost > 0.) {
         for (float& v : y) v *= static_cast<float>(1. + boost);
@@ -751,8 +1198,9 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
     if (model) {
         double gain = o.volume*.01;
         if (o.peak_normalize) {
-            double dry_peak = 0., harmonic_peak = 0.;
-            for (float v : y) dry_peak = std::max(dry_peak, double(std::abs(v)));
+            double dry_peak = recorded_peak, harmonic_peak = 0.;
+            if (!anchor_peak)
+                for (float v : y) dry_peak = std::max(dry_peak, double(std::abs(v)));
             for (const auto& frame : model->frames) {
                 double bound = 0.;
                 for (const auto coefficient : frame.harmonics) bound += 2.*std::abs(coefficient);
@@ -769,7 +1217,7 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
         model->residual = std::move(y);
         return {};
     }
-    gain_stage(y, o);
+    gain_stage(y, o, anchor_peak ? recorded_peak : -1.);
     result.synthesis_ms = milliseconds(ts);
     if (report) *report = result;
     return std::move(y);
