@@ -7,6 +7,10 @@
 #include <cmath>
 #include <memory>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 namespace tn::detail {
 namespace {
 constexpr double pi = 3.14159265358979323846;
@@ -190,15 +194,18 @@ void return_breath(const std::vector<float>& input, int sr, const std::vector<do
     const int hop = std::max(1, static_cast<int>(std::lround(.008 * sr)));
     const auto refined = refine_ridge_marks(input, sr, marks);
     const PhaseMap phase(refined.empty() ? marks : refined);
-    std::array<std::unique_ptr<Work>, 15> cache{};
     std::vector<float> removed(len), normalizer(len);
-    std::vector<Peak> peaks;
-    std::vector<std::array<double, 2>> comb;
-    auto voice = voiced.begin();
-    for (int center = 0; center < len; center += hop) {
-        while (voice != voiced.end() && center >= voice->marks.back()) ++voice;
-        if (voice == voiced.end()) break;
-        if (center < voice->marks.front()) continue;
+    struct Scratch {
+        std::array<std::unique_ptr<Work>, 15> plans{};
+        std::vector<Peak> peaks;
+        std::vector<std::array<double, 2>> comb;
+    };
+    struct Block {
+        const Work* work = nullptr;
+        int start = 0, stop = 0;
+        double left = 0., phase_step = 0.;
+    };
+    const auto analyze = [&](int center, Scratch& scratch) -> Block {
         const double middle = phase.phase(center);
         const double period = (phase.time(middle+2.)-phase.time(middle-2.))*.25;
         // Shorter bass windows limit phase drift without merging the ridges.
@@ -209,13 +216,14 @@ void return_breath(const std::vector<float>& input, int sr, const std::vector<do
         const double begin = phase.time(left), end = phase.time(right);
         const int start = std::max(0, static_cast<int>(std::ceil(begin)));
         const int stop = std::min(len, static_cast<int>(std::ceil(end)));
-        if (stop <= start) continue;
+        if (stop <= start) return {};
         const double f0 = sr*cycles/(end-begin);
         int exponent = 8;
         while (exponent < 14 && (1<<exponent) < 1.10*(end-begin)) ++exponent;
         const int n = 1<<exponent, half = n/2;
-        if (!cache[exponent]) cache[exponent] = std::make_unique<Work>(n);
-        auto& w = *cache[exponent];
+        auto& plan = scratch.plans[exponent];
+        if (!plan) plan = std::make_unique<Work>(n);
+        auto& w = *plan;
         const double phase_step = double(cycles)/n;
         // With a high supplied F0 the fundamental itself can enter this band.
         const int first_order = std::max(1, static_cast<int>(std::floor(1050./f0)));
@@ -240,6 +248,8 @@ void return_breath(const std::vector<float>& input, int sr, const std::vector<do
             frame_max = std::max(frame_max,w.power[k]);
         }
         const float floor = std::max(1e-16f, frame_max*3e-8f);
+        auto& peaks = scratch.peaks;
+        auto& comb = scratch.comb;
         peaks.resize(static_cast<std::size_t>(last_order+1));
         comb.resize(peaks.size());
         const int core = std::max(1, cycles/5);
@@ -282,11 +292,17 @@ void return_breath(const std::vector<float>& input, int sr, const std::vector<do
             w.frames[k] = (high*(1.f-w.keep[k]))*w.average[k];
         }
         w.inverse.run(w.frames, w.removed, 1.f/n);
-        cycle = phase.cycle(start);
-        for (int i = start; i < stop;) {
+        return {&w, start, stop, left, phase_step};
+    };
+    const auto overlap = [&](const Block& block) {
+        if (!block.work) return;
+        const auto& w = *block.work;
+        const auto left = block.left, phase_step = block.phase_step;
+        int cycle = phase.cycle(block.start);
+        for (int i = block.start; i < block.stop;) {
             const double p = phase.position(cycle), q = phase.position(cycle+1);
             const double scale = 1./((q-p)*phase_step);
-            const int limit = std::min(stop, static_cast<int>(std::ceil(q)));
+            const int limit = std::min(block.stop, static_cast<int>(std::ceil(q)));
             for (; i < limit; ++i) {
                 const double pos = (cycle-left)/phase_step+(i-p)*scale;
                 const float win = interpolate(w.window,pos);
@@ -295,6 +311,35 @@ void return_breath(const std::vector<float>& input, int sr, const std::vector<do
             }
             ++cycle;
         }
+    };
+    std::vector<int> centers;
+    auto voice = voiced.begin();
+    for (int center = 0; center < len; center += hop) {
+        while (voice != voiced.end() && center >= voice->marks.back()) ++voice;
+        if (voice == voiced.end()) break;
+        if (center >= voice->marks.front()) centers.push_back(center);
+    }
+#ifdef _OPENMP
+    // Classic hosts can run many resamplers at once. Bound the work per
+    // process and avoid launching a team for ordinary short phonemes.
+    const int workers = std::min({4, omp_get_max_threads(), static_cast<int>(centers.size()/32)});
+    if (workers > 1 && !omp_in_parallel()) {
+#pragma omp parallel num_threads(workers)
+        {
+            Scratch scratch;
+#pragma omp for ordered schedule(static, 1)
+            for (int i = 0; i < static_cast<int>(centers.size()); ++i) {
+                const auto block = analyze(centers[i], scratch);
+                // Preserve the sequence of float additions at each sample.
+#pragma omp ordered
+                overlap(block);
+            }
+        }
+    } else
+#endif
+    {
+        Scratch scratch;
+        for (const int center : centers) overlap(analyze(center, scratch));
     }
     const auto gain = static_cast<float>(amount);
     for (const auto& island : voiced) {

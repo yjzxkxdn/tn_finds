@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# Direct MinGW build: standard F0. The official Nebula build uses CMake.
 [CmdletBinding()]
 param(
     [string]$Cxx = 'g++',
@@ -20,16 +19,16 @@ if ($LASTEXITCODE -ne 0 -or $target -notmatch '^x86_64-.*mingw') {
 }
 Push-Location -LiteralPath $PSScriptRoot
 try {
-    $sources = @('src/main.cpp', 'src/wav.cpp', 'src/engine.cpp', 'src/pitch.cpp',
+    $sources = @('src/main.cpp', 'src/wav.cpp', 'src/mrq.cpp', 'src/mrq_binding.cpp', 'src/engine.cpp', 'src/pitch.cpp',
         'src/formant.cpp', 'src/glottal.cpp', 'src/harmonic_phase.cpp', 'src/harmonic_mask.cpp',
         'src/harmonic_ridges.cpp', 'src/harmonic_synth.cpp')
     $builds = if ($Mode -eq 'Both') { 'Resampler', 'Phrase' } else { $Mode }
     foreach ($build in $builds) {
-        $name = if ($OutputName) { $OutputName } else { 'tn_finds_v0.4.8-' + $build.ToLowerInvariant() + '.exe' }
+        $name = if ($OutputName) { $OutputName } else { 'tn_finds_v0.4.9-' + $build.ToLowerInvariant() + '.exe' }
         $extra = if ($build -eq 'Phrase') {
             '-DTN_FINDS_DUAL_ROLE=1', 'src/wavtool.cpp', 'src/bat_host.cpp', 'src/phrase.cpp', 'src/phrase_io.cpp'
         } else { @() }
-        & $compiler -std=c++17 -O3 -Wall -Wextra -Wpedantic -municode -static @sources @extra -o $name
+        & $compiler -std=c++17 -O3 -Wall -Wextra -Wpedantic -municode -static @sources @extra -lbcrypt -o $name
         if ($LASTEXITCODE -ne 0) { throw "g++ failed with exit code $LASTEXITCODE." }
         & "./$name" --version
         if ($LASTEXITCODE -ne 0) { throw 'The built executable did not run.' }

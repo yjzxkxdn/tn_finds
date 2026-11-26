@@ -30,6 +30,11 @@ Track estimate(const std::vector<float>& x, int sr);
 // call estimate().
 Track estimate_source(const std::vector<float>& x, int sr);
 
+// Which of the two estimate_source paths this build links. Callers that need
+// Moresampler-compatible output (a desc.mrq trajectory) must check this: only
+// the Nebula grid and voicing match what the other resamplers expect.
+bool nebula_source_backend();
+
 // Continue a phase clock through unsupported spans with zero confidence.
 Track bridge_clock(Track track);
 

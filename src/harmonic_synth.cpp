@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <type_traits>
 #include <vector>
 
 namespace tn::detail {
@@ -24,10 +25,29 @@ float cubic(float a, float b, float c, float d, float t) {
     return b + .5f*t*(c-a + t*(2*a-5*b+4*c-d + t*(3*(b-c)+d-a)));
 }
 
-float sample(const std::vector<float>& x, double at) {
-    const int j = static_cast<int>(std::floor(at));
-    const auto read = [&](int i) { return i < 0 || i >= static_cast<int>(x.size()) ? 0.f : x[i]; };
-    return cubic(read(j-1), read(j), read(j+1), read(j+2), static_cast<float>(at-j));
+// The cycle fill calls this twice per table sample; keeping the four-tap
+// interpolation in line removes the call overhead from that inner loop.
+#if defined(_MSC_VER)
+#define TN_FORCE_INLINE __forceinline
+#else
+#define TN_FORCE_INLINE inline __attribute__((always_inline))
+#endif
+
+template<bool interior>
+TN_FORCE_INLINE float sample(const std::vector<float>& x, double at) {
+    if constexpr (interior) {
+        const int j = static_cast<int>(at); // All four taps are inside x, at >= 0.
+        return cubic(x[j-1], x[j], x[j+1], x[j+2], static_cast<float>(at-j));
+    } else {
+        const int j = static_cast<int>(std::floor(at));
+        const auto read = [&](int i) { return i < 0 || i >= static_cast<int>(x.size()) ? 0.f : x[i]; };
+        return cubic(read(j-1), read(j), read(j+1), read(j+2), static_cast<float>(at-j));
+    }
+}
+
+bool interior_span(const std::vector<float>& x, double first, double last, double span) {
+    // Leave an extra sample of margin for rounding the interpolated positions.
+    return first-span >= 2. && last+span <= double(x.size())-3.;
 }
 
 struct Cycle {
@@ -70,16 +90,20 @@ class SourceCycles {
         entry.wave.resize(size);
         const Cycle c = cycle_at(marks_, index);
         const double period = c.period();
-        for (int j = 0; j < size; ++j) {
-            const double u = double(j)/size, back = 1.-u;
-            // Both sides meet at the same sample with the same phase slope.
-            const double ahead = u*(c.right+(period-c.right)*back*back*back*(1.+3.*u));
-            const double behind = back*(c.left+(period-c.left)*u*u*u*(1.+3.*back));
-            const float a = sample(source_, c.center+ahead);
-            const float b = sample(source_, c.center-behind);
-            const float blend = static_cast<float>(u*u*u*(10.+u*(-15.+6.*u)));
-            entry.wave[j] = a + blend*(b-a);
-        }
+        const auto fill = [&](auto inside) {
+            for (int j = 0; j < size; ++j) {
+                const double u = double(j)/size, back = 1.-u;
+                // Both sides meet at the same sample with the same phase slope.
+                const double ahead = u*(c.right+(period-c.right)*back*back*back*(1.+3.*u));
+                const double behind = back*(c.left+(period-c.left)*u*u*u*(1.+3.*back));
+                const float a = sample<inside.value>(source_, c.center+ahead);
+                const float b = sample<inside.value>(source_, c.center-behind);
+                const float blend = static_cast<float>(u*u*u*(10.+u*(-15.+6.*u)));
+                entry.wave[j] = a + blend*(b-a);
+            }
+        };
+        if (interior_span(source_, c.center, c.center, std::max(c.left, c.right))) fill(std::true_type{});
+        else fill(std::false_type{});
         return entry.wave;
     }
 
@@ -132,13 +156,17 @@ public:
         // to one. Reject shorter spans instead of filling a gap in the probe.
         const double step = period/bell.size();
         const auto u = static_cast<float>(mix_);
-        for (std::size_t j = 0; j < bell.size(); ++j) {
-            const double dt = j*step, previous = dt-period;
-            const float a0 = sample(source_, a.center+dt), b0 = sample(source_, b.center+dt);
-            const float a1 = sample(source_, a.center+previous), b1 = sample(source_, b.center+previous);
-            const float forward = a0+u*(b0-a0), backward = a1+u*(b1-a1);
-            out[j] = backward+bell[j]*(forward-backward);
-        }
+        const auto fill = [&](auto inside) {
+            for (std::size_t j = 0; j < bell.size(); ++j) {
+                const double dt = j*step, previous = dt-period;
+                const float a0 = sample<inside.value>(source_, a.center+dt), b0 = sample<inside.value>(source_, b.center+dt);
+                const float a1 = sample<inside.value>(source_, a.center+previous), b1 = sample<inside.value>(source_, b.center+previous);
+                const float forward = a0+u*(b0-a0), backward = a1+u*(b1-a1);
+                out[j] = backward+bell[j]*(forward-backward);
+            }
+        };
+        if (interior_span(source_, a.center, b.center, period)) fill(std::true_type{});
+        else fill(std::false_type{});
         return true;
     }
 };
@@ -195,8 +223,12 @@ class Tables {
     Fft fft_;
     std::optional<RealInverseFft> output_fft_;
     std::vector<Complex> spec_, folded_, output_spec_, unshaped_spec_;
-    std::vector<float> cycle_, bell_, log_amp_, linear_amp_, phase_, model_amplitude_;
+    std::vector<float> cycle_, original_cycle_, bell_, source_power_, source_angle_, log_amp_, linear_amp_,
+                       phase_, model_amplitude_;
     std::vector<double> arcs_, output_phase_, fold_difference_, model_phase_;
+    SourceFilterWork filter_work_;
+    double spectrum_at_ = no_phase, spectrum_hz_ = 0., folded_hz_ = no_phase, old_power_ = 0.;
+    float peak_ = 0.f;
     double source_origin_ = 0., output_origin_ = 0.;
     bool voiced_ = false;
 
@@ -233,7 +265,8 @@ class Tables {
 
 public:
     explicit Tables(int size) : fft_(size), spec_(size), folded_(size), output_spec_(size+1),
-        cycle_(size), bell_(size), log_amp_(size/2), linear_amp_(size/2), phase_(size/2), arcs_(size/2, no_phase),
+        cycle_(size), bell_(size), source_power_(size/2), source_angle_(size/2), log_amp_(size/2),
+        linear_amp_(size/2), phase_(size/2), arcs_(size/2, no_phase),
         output_phase_(size/2, no_phase), fold_difference_(size/2, no_phase) {
         for (int j = 0; j < size; ++j)
             bell_[j] = static_cast<float>(.5+.5*std::cos(pi*j/size));
@@ -245,28 +278,52 @@ public:
         if (frame) frame->hz = static_cast<float>(hz);
         if (weight <= 0.f) { reset_phase(); return; }
         const int size = static_cast<int>(spec_.size()), half = size/2;
-        const double source_hz = source.read(at, cycle_);
-        for (int j = 0; j < size; ++j) spec_[j] = Complex(cycle_[j], 0.f);
-        fft_.run(spec_);
+        // A held sustain can read exactly the same source point for many
+        // output frames. Reuse stationary measurements, not target phase.
+        const bool new_source = at != spectrum_at_;
+        if (new_source) {
+            spectrum_at_ = at;
+            spectrum_hz_ = source.read(at, cycle_);
+            for (int j = 0; j < size; ++j) spec_[j] = Complex(cycle_[j], 0.f);
+            fft_.run(spec_);
+            unshaped_spec_.clear();
+            folded_hz_ = no_phase;
+        }
+        const double source_hz = spectrum_hz_;
         const int old_last = std::clamp(static_cast<int>(.485*sr/source_hz), 1, half-1);
         const int new_last = std::clamp(static_cast<int>(.485*sr/hz), 1, half-1);
-        double old_power = 0.;
-        float peak = 0.f;
-        for (int k = 1; k <= old_last; ++k) {
-            const float p = std::norm(spec_[k]);
-            old_power += p;
-            peak = std::max(peak, p);
+        // These measurements depend only on the source FFT. Keep the raw
+        // angles here; the moving origin and temporal arcs are updated below.
+        if (new_source) {
+            old_power_ = 0.;
+            peak_ = 0.f;
+            for (int k = 1; k <= old_last; ++k) {
+                const float power = std::norm(spec_[k]);
+                source_power_[k] = power;
+                old_power_ += power;
+                peak_ = std::max(peak_, power);
+            }
+            if (old_power_ >= 1.e-16) {
+                const float floor = std::max(1.e-20f, peak_*1.e-12f);
+                for (int k = 1; k <= old_last; ++k) {
+                    const float bounded = std::max(floor, source_power_[k]);
+                    log_amp_[k] = .5f*std::log(bounded);
+                    linear_amp_[k] = std::sqrt(bounded);
+                    source_angle_[k] = std::arg(spec_[k]);
+                }
+            }
         }
+        const double old_power = old_power_;
+        const float peak = peak_;
         if (old_power < 1.e-16) { out.weight = 0.f; reset_phase(); return; }
 
-        const auto fundamental = spec_[1];
-        const double fundamental_power = std::norm(fundamental);
-        const float fundamental_amp = std::abs(fundamental);
+        const double fundamental_power = source_power_[1];
+        const float fundamental_amp = std::abs(spec_[1]);
         // A weak H1 is an unreliable source phase reference. Hold the last
         // reference through a weak patch and keep the output origin fixed
         // to the target clock throughout the voiced region.
         const double reference = smooth((std::sqrt(fundamental_power/peak)-.02)/.08);
-        const double origin = std::arg(fundamental);
+        const double origin = source_angle_[1];
         if (!voiced_) {
             source_origin_ = output_origin_ = reference > 0. ? origin : 0.;
             voiced_ = true;
@@ -281,17 +338,13 @@ public:
         const float phase_floor = peak*1.e-6f;
         const double source_origin = std::remainder(source_origin_, 2*pi);
         for (int k = 1; k <= old_last; ++k) {
-            const float power = std::norm(spec_[k]);
-            const float bounded = std::max(floor, power);
-            log_amp_[k] = .5f*std::log(bounded);
-            linear_amp_[k] = std::sqrt(bounded);
-            phase_[k] = static_cast<float>(std::arg(spec_[k])-k*source_origin);
+            phase_[k] = static_cast<float>(source_angle_[k]-k*source_origin);
             if (k == 1) continue;
             auto& arc = arcs_[k-1];
             const double difference = double(phase_[k])-phase_[k-1];
             // The shortest arc is ambiguous around +/-pi. Unwrap the arc
             // over time so a branch crossing does not flip the interpolant.
-            if (power > phase_floor && std::norm(spec_[k-1]) > phase_floor) {
+            if (source_power_[k] > phase_floor && source_power_[k-1] > phase_floor) {
                 arc = std::isfinite(arc) ? arc + std::remainder(difference-arc, 2*pi)
                                          : std::remainder(difference, 2*pi);
             } else {
@@ -306,10 +359,15 @@ public:
         double pulse_weight = overtone_mix*smooth((pitch_ratio-1.025)/.23);
         double pulse_origin = 0., pulse_peak = 0.;
         if (pulse_weight > 0.) {
-            if (source.pulse(sr/hz, bell_, folded_))
-                fft_.run(folded_);
-            else
-                fold_pulse(1./pitch_ratio);
+            // Only the unrotated measurement is reusable. The phase
+            // difference and bandwidth limits below still advance each frame.
+            if (hz != folded_hz_) {
+                if (source.pulse(sr/hz, bell_, folded_))
+                    fft_.run(folded_);
+                else
+                    fold_pulse(1./pitch_ratio);
+                folded_hz_ = hz;
+            }
             float peak_power = 0.f;
             for (int k = 1; k <= new_last; ++k) peak_power = std::max(peak_power, std::norm(folded_[k]));
             pulse_peak = std::sqrt(peak_power);
@@ -342,19 +400,20 @@ public:
             }
             if (phase_blend > 0. && rd > 0.) {
                 if (original_cycles) {
-                    original_cycles->read(at, cycle_);
-                    unshaped_spec_.resize(size);
-                    for (int j = 0; j < size; ++j) unshaped_spec_[j] = Complex(cycle_[j], 0.f);
-                    fft_.run(unshaped_spec_);
+                    if (unshaped_spec_.empty()) {
+                        original_cycle_.resize(size);
+                        original_cycles->read(at, original_cycle_);
+                        unshaped_spec_.resize(size);
+                        for (int j = 0; j < size; ++j) unshaped_spec_[j] = Complex(original_cycle_[j], 0.f);
+                        fft_.run(unshaped_spec_);
+                    }
                     phase_spectrum = &unshaped_spec_;
                 }
                 const int orders = std::min({80, old_last, static_cast<int>(12000./source_hz)});
-                source_filter_spectrum(*phase_spectrum, orders, source_hz, hz, rd,
-                                       phase_reference->formant_ratio, model_phase_,
-                                       amplitude_blend > 0. ? &model_amplitude_ : nullptr);
+                model_source_peak = source_filter_spectrum(*phase_spectrum, orders, source_hz, hz, rd,
+                    phase_reference->formant_ratio, model_phase_,
+                    amplitude_blend > 0. ? &model_amplitude_ : nullptr, filter_work_);
                 model_source_orders = orders;
-                for (int k = 1; k <= orders; ++k)
-                    model_source_peak = std::max(model_source_peak, double(std::abs((*phase_spectrum)[k])));
             }
         }
 
@@ -405,7 +464,7 @@ public:
             }
             if (k > 1 && k < static_cast<int>(model_phase_.size()) && std::isfinite(output_phase_[1])) {
                 const double source_strength = k <= model_source_orders ?
-                    std::abs((*phase_spectrum)[k])/model_source_peak : 1.;
+                    filter_work_.source_magnitude[k]/model_source_peak : 1.;
                 const double band = 1.-smooth((k*hz-6000.)/2000.);
                 const double confidence = phase_blend*band*smooth((source_strength-.0015)/.012);
                 const double desired = k*output_phase_[1]+model_phase_[k];

@@ -507,6 +507,14 @@ Track estimate_source(const std::vector<float>& x, int sr) {
 #endif
 }
 
+bool nebula_source_backend() {
+#ifdef TN_FINDS_NEBULA_F0
+    return true;
+#else
+    return false;
+#endif
+}
+
 Track candidate_clock(const std::vector<float>& x, int sr, const Track& anchors, bool supplied) {
     Track tr = anchors;
     if (tr.frames.empty()) return tr;

@@ -8,6 +8,7 @@
 #include "harmonic_phase.hpp"
 #include "harmonic_synth.hpp"
 #include "pitch.hpp"
+#include "source_analysis.hpp"
 
 #include <algorithm>
 #include <array>
@@ -126,24 +127,32 @@ void choose_loop(TimeMap& t, const std::vector<double>& marks, const detail::Har
     }
 }
 
-pitch::Track source_track(const std::vector<float>& x, int sr, int start, const Options& o,
-                          const std::vector<float>& input) {
-    if (o.f0.empty() && o.forced_hz == 0) {
+pitch::Track rebase_source_track(const pitch::Track& track, std::size_t start, std::size_t count) {
+    pitch::Track local;
+    local.step = track.step;
+    const std::size_t last = count-1;
+    const std::size_t frames = 1+(last+local.step-1)/local.step;
+    local.frames.reserve(frames);
+    for (std::size_t i = 0; i < frames; ++i)
+        local.frames.push_back(pitch::sample(track, static_cast<double>(start+std::min(i*local.step, last))));
+    return local;
+}
+
+pitch::Track source_track(const detail::SourceAnalysisInput& in) {
+    const auto& x = in.segment;
+    const auto sr = in.rate, start = in.first;
+    if (!in.mrq_f0.frames.empty()) {
+        if (start == 0 && x.size() == in.recording.size()) return in.mrq_f0;
+        return rebase_source_track(in.mrq_f0, start, x.size());
+    }
+    if (in.f0.empty() && in.forced_hz == 0) {
 #ifdef TN_FINDS_NEBULA_F0
         // OpenMoresampler estimates on the complete recording. Rebase the
         // resulting F0 to the OTO analysis buffer in source samples.
-        auto track = pitch::estimate_source(input, sr);
-        if (start == 0 && x.size() == input.size()) return track;
-        pitch::Track local;
-        local.step = track.step;
-        const std::size_t last = x.size()-1;
-        const std::size_t count = 1+(last+local.step-1)/local.step;
-        local.frames.reserve(count);
-        for (std::size_t i = 0; i < count; ++i)
-            local.frames.push_back(pitch::sample(track, start+std::min(i*local.step, last)));
-        return local;
+        auto track = pitch::estimate_source(in.recording, sr);
+        if (start == 0 && x.size() == in.recording.size()) return track;
+        return rebase_source_track(track, start, x.size());
 #else
-        (void)input;
         return pitch::estimate(x, sr);
 #endif
     }
@@ -153,10 +162,10 @@ pitch::Track source_track(const std::vector<float>& x, int sr, int start, const 
     tr.frames.resize(count);
     std::size_t j = 0;
     for (std::size_t i = 0; i < count; ++i) {
-        double hz = o.forced_hz;
+        double hz = in.forced_hz;
         if (hz == 0) {
             const double time = (start + static_cast<double>(i) * tr.step) / sr;
-            const auto& p = o.f0;
+            const auto& p = in.f0;
             if (time <= p.front().time_s) hz = p.front().hz;
             else if (time >= p.back().time_s) hz = p.back().hz;
             else {
@@ -169,6 +178,45 @@ pitch::Track source_track(const std::vector<float>& x, int sr, int start, const 
         if (hz > 0) tr.frames[i] = {hz, 1.};
     }
     return tr;
+}
+
+detail::SourceAnalysis analyze_source(const detail::SourceAnalysisInput& in) {
+    detail::SourceAnalysis a;
+    if (in.forced_hz < 0.) return a;
+    const auto& x = in.segment;
+    const int sr = in.rate;
+    auto anchors = source_track(in);
+    const bool mrq = !in.mrq_f0.frames.empty();
+    const bool supplied = !in.f0.empty() || in.forced_hz > 0.;
+    const auto voiced = [](pitch::Frame f) { return f.hz > 0.; };
+    if (mrq && std::none_of(anchors.frames.begin(), anchors.frames.end(), voiced)) {
+        // An all-unvoiced MRQ (including an OTO slice of a voiced file) is
+        // still an authoritative track, not a reason to estimate F0.
+        a.clock = std::move(anchors);
+        return a;
+    }
+#ifdef TN_FINDS_NEBULA_F0
+    // Nebula and MRQ both provide the voicing and frequency of each frame.
+    const bool bridge = !supplied;
+#else
+    const bool bridge = mrq;
+#endif
+    // The bridged clock only supplies phase continuity through UV spans.
+    // The original track still supplies the separator's voicing evidence.
+    a.clock = bridge ? pitch::bridge_clock(anchors) : pitch::candidate_clock(x, sr, anchors, supplied);
+    auto support = pitch::locate(x, sr, a.clock);
+    if (support.empty()) return a;
+    const std::vector<pitch::Island>* located = nullptr;
+    // With no UV frames, bridging leaves the track and its pulse locations unchanged.
+    const bool fully_voiced = bridge && std::all_of(anchors.frames.begin(), anchors.frames.end(), voiced);
+    if (fully_voiced) located = &support;
+    a.split = detail::split_harmonic(x, sr, support.front().marks, a.clock, in.cleanup,
+                                    in.mask_return, supplied ? nullptr : &anchors, located,
+                                    mrq && !fully_voiced);
+    a.pulses = std::move(support.front());
+    if (in.need_rd && !a.split.harmonic.empty())
+        a.rd = detail::estimate_glottal_track(a.split.harmonic, a.pulses.marks, a.split, sr);
+    return a;
 }
 
 double center_pitch(const pitch::Track& tr, const TimeMap& t) {
@@ -225,7 +273,7 @@ Warp stretch(const std::vector<float>& x, const detail::HarmonicSplit& split,
         const int p = std::clamp(at, begin, last);
         return double(x[p])-(h.empty() ? 0.f : h[p]);
     };
-    std::vector<double> reference, candidates;
+    std::vector<double> reference, candidates, cross, energy;
     reference.reserve((hop+stride-1)/stride);
     // At velocity 100, no WSOLA overlap should reach back into the fixed
     // consonant: a sharp attack cannot move just because the vowel stretches.
@@ -268,9 +316,23 @@ Warp stretch(const std::vector<float>& x, const detail::HarmonicSplit& split,
                 candidates.resize(reference.size()+trials-1);
                 for (std::size_t k = 0; k < candidates.size(); ++k)
                     candidates[k] = residual(want-search-span+stride/2+static_cast<int>(k)*stride);
+                // Vectorize across independent delay trials rather than a
+                // sum over time. Each trial retains its original sum order.
+                cross.assign(trials, 0.);
+                energy.assign(trials, 0.);
+                for (std::size_t k = 0; k < reference.size(); ++k) {
+                    const double v = reference[k];
+                    const auto* q = candidates.data()+k;
+                    for (int trial = 0; trial < trials; ++trial) {
+                        const double w = q[trial];
+                        cross[trial] += v*w;
+                        energy[trial] += w*w;
+                    }
+                }
                 double best = agreement;
                 for (int trial = 0, d = -search; trial < trials; ++trial, d += stride) {
-                    const double corr = score(candidates.data()+trial);
+                    const double norm = aa*energy[trial];
+                    const double corr = norm > 1.e-28 ? cross[trial]/std::sqrt(norm) : 0.;
                     const double cost = corr - (.12 + .60 * periodic_share) * std::abs(d) / search;
                     if (cost > best) { best = cost; b = want + d; agreement = corr; }
                 }
@@ -360,7 +422,7 @@ std::vector<float> synthesize_residual(const std::vector<float>& x, const detail
     std::vector<detail::Complex> spec(n);
     std::vector<float> window(2*radius+1), smoothed(half+1);
     std::vector<double> sum(half+1);
-    struct PowerFrame { int index = -1; std::vector<float> power; };
+    struct PowerFrame { int index = -1, center = -1; std::vector<float> power; };
     std::array<PowerFrame, 4> powers;
     for (int j = 0; j <= 2*radius; ++j)
         window[j] = static_cast<float>(.5-.5*std::cos(pi*j/radius));
@@ -379,7 +441,6 @@ std::vector<float> synthesize_residual(const std::vector<float>& x, const detail
         auto& power = cached.power;
         if (cached.index == frame) return power;
         cached.index = frame;
-        power.assign(half+1, 0.f);
         const double position = frame < fixed_frames
             ? map.source_begin+fixed_width*frame/fixed_frames
             : left+width*(frame-fixed_frames)/tail_frames;
@@ -397,6 +458,18 @@ std::vector<float> synthesize_residual(const std::vector<float>& x, const detail
             const double blend = join_weight*smooth((center-join_center)/double(radius));
             analysis = static_cast<int>(std::lround(mix(analysis, std::min(analysis, join_center), blend)));
         }
+        // Near a short tail, distinct grid points can map to the same actual
+        // one-sided analysis window. Keep the same PSD in the requested slot
+        // so the pair of adjacent-frame references below remains stable.
+        if (cached.center == analysis) return power;
+        cached.center = analysis;
+        for (const auto& other : powers) {
+            if (&other != &cached && other.center == analysis) {
+                power = other.power;
+                return power;
+            }
+        }
+        power.assign(half+1, 0.f);
         const int start = analysis-radius;
         const int begin = std::max(0, -start), end = std::min(2*radius, input_size-start);
         const auto frame_pitch = pitch::sample(clock, analysis);
@@ -832,6 +905,15 @@ void validate(const std::vector<float>& input, int sr, const Options& o) {
     for (float v : input) if (!std::isfinite(v) || std::abs(v) > 64.f)
         throw std::invalid_argument("expected finite audio with magnitude <= 64");
     for (int v : o.bends) if (v < -2048 || v > 2047) throw std::invalid_argument("invalid pitch bend");
+    if (!o.mrq_f0.frames.empty()) {
+        if (!o.f0.empty() || o.forced_hz != 0. || o.mrq_f0.step < 1 || o.mrq_f0.step > sr ||
+            o.mrq_f0.frames.size() > 1'000'000)
+            throw std::invalid_argument("invalid MRQ F0 track or conflicting source F0 options");
+        for (const auto f : o.mrq_f0.frames)
+            if (!(f.hz == 0. || (f.hz >= 30. && f.hz <= std::min(2400., sr / 3.))) ||
+                f.confidence != (f.hz == 0. ? 0. : 1.))
+                throw std::invalid_argument("invalid MRQ F0 frame");
+    }
     double last = -1;
     for (const auto& p : o.f0) {
         if (!std::isfinite(p.time_s) || p.time_s < 0 || p.time_s <= last || !std::isfinite(p.hz) ||
@@ -899,28 +981,21 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
     const double ratio = spectral_formant ? 1. : formant_ratio;
     const bool resynthesize = !unchanged_clock || ratio != 1.;
     const bool source_filter = resynthesize && ratio == 1. && !o.phase_lock;
-    pitch::Track clock;
-    std::vector<pitch::Island> support;
-    detail::HarmonicSplit split;
-    if (o.forced_hz >= 0.) {
-        const auto anchors = source_track(x, sr, analysis_first, o, input);
-        const bool supplied = !o.f0.empty() || o.forced_hz > 0.;
-#ifdef TN_FINDS_NEBULA_F0
-        // The model has already selected voiced frames and their frequencies.
-        clock = supplied ? pitch::candidate_clock(x, sr, anchors, true) : pitch::bridge_clock(anchors);
+    if (!o.mrq_f0.frames.empty()) result.f0_backend = "mrq";
+    else if (!o.f0.empty()) result.f0_backend = "csv";
+    else if (o.forced_hz != 0.) result.f0_backend = "forced";
+    const detail::SourceAnalysisInput analysis_input{input, x, o.f0, o.mrq_f0, sr, analysis_first, o.forced_hz,
+                                                     o.mask_return, resynthesize, o.tension != 0. || source_filter};
+#ifdef TN_FINDS_ANALYSIS_CACHE_ID
+    const auto analysis = detail::cached_source_analysis(analysis_input, analyze_source, result.analysis_cache_hit);
 #else
-        clock = pitch::candidate_clock(x, sr, anchors, supplied);
+    const auto analysis = analyze_source(analysis_input);
 #endif
-        support = pitch::locate(x, sr, clock);
-        if (!support.empty())
-            split = detail::split_harmonic(x, sr, support.front().marks, clock, resynthesize,
-                                           o.mask_return, supplied ? nullptr : &anchors);
-    }
+    const auto& clock = analysis.clock;
+    const auto& split = analysis.split;
+    const auto& source_rd = analysis.rd;
     const auto& h = split.harmonic;
-    detail::GlottalTrack source_rd;
     if (!h.empty()) {
-        if (o.tension != 0. || source_filter)
-            source_rd = detail::estimate_glottal_track(h, support.front().marks, split, sr);
         // Bridging supplies a clock, even through breaths. Those interpolated
         // pitches must not contribute to the representative source note.
         auto measured = clock;
@@ -932,7 +1007,7 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
         }
         result.source_pitch_hz = center_pitch(measured, time);
         if ((o.loop || o.force_loop) && !time.identity())
-            choose_loop(time, support.front().marks, split, sr, o.force_loop);
+            choose_loop(time, analysis.pulses.marks, split, sr, o.force_loop);
     }
     result.islands = split.regions();
     result.loop_used = time.looping();
@@ -992,7 +1067,7 @@ static std::vector<float> render_impl(const std::vector<float>& input, int sr, c
             }
         }
         const auto& source = spectral_formant ? shaped : h;
-        const auto& is = support.front();
+        const auto& is = analysis.pulses;
         const SustainSource sustain_source(time, is.marks, split, sr, sustain_guard);
         detail::TargetClock target;
         const auto grains = target_grains(active, time, is, clock, o, result.source_pitch_hz, sr,

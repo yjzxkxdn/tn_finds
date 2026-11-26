@@ -13,14 +13,17 @@ extern "C" {
 #include <stdexcept>
 
 namespace tn::pitch {
+namespace {
+int native_hop(int rate) {
+    int step = 1;
+    while (step*200 < rate) step *= 2;
+    return step;
+}
 
-Track estimate_nebula(const std::vector<float>& input, int rate) {
+Track analyze_nebula(const std::vector<float>& input, int rate) {
     Track result;
-    if (input.empty() || input.size() > 16'000'000 || rate < 8000 || rate > 192000) return result;
-
     // Nebula uses a 5 ms grid on the source clock.
-    result.step = 1;
-    while (result.step*200 < rate) result.step *= 2;
+    result.step = native_hop(rate);
     const auto [low, high] = std::minmax_element(input.begin(), input.end());
     if (!std::isfinite(*low) || !std::isfinite(*high) || *low < -64.f || *high > 64.f)
         throw std::invalid_argument("Nebula expects finite audio with magnitude <= 64");
@@ -51,6 +54,21 @@ Track estimate_nebula(const std::vector<float>& input, int rate) {
         else result.frames.push_back({});
     }
     return result;
+}
+} // namespace
+
+#ifdef TN_FINDS_NEBULA_CACHE_ID
+Track cached_nebula(const std::vector<float>&, int rate, int step,
+                    Track (*analyze)(const std::vector<float>&, int));
+#endif
+
+Track estimate_nebula(const std::vector<float>& input, int rate) {
+    if (input.empty() || input.size() > 16'000'000 || rate < 8000 || rate > 192000) return {};
+#ifdef TN_FINDS_NEBULA_CACHE_ID
+    return cached_nebula(input, rate, native_hop(rate), analyze_nebula);
+#else
+    return analyze_nebula(input, rate);
+#endif
 }
 
 } // namespace tn::pitch

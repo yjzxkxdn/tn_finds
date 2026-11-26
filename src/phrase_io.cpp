@@ -61,6 +61,15 @@ public:
         if (little_endian()) bytes(v.data(), n*sizeof(float));
         else for (auto& x : v) x = value<float>();
     }
+    void complex_floats(std::vector<std::complex<float>>& v, std::size_t n) {
+        v.resize(n); // caller checked the frame dimensions
+        // std::complex<float> arrays store alternating real/imaginary floats.
+        if (little_endian()) bytes(v.data(), n*(2*sizeof(float)));
+        else for (auto& x : v) {
+            const auto re = value<float>(), im = value<float>();
+            x = {re, im};
+        }
+    }
 };
 
 class Writer {
@@ -81,6 +90,10 @@ public:
     void floats(const std::vector<float>& v) {
         if (little_endian()) bytes(v.data(), v.size()*sizeof(float));
         else for (const auto x : v) value(x);
+    }
+    void complex_floats(const std::vector<std::complex<float>>& v) {
+        if (little_endian()) bytes(v.data(), v.size()*(2*sizeof(float)));
+        else for (const auto& x : v) { value(x.real()); value(x.imag()); }
     }
 };
 
@@ -114,12 +127,9 @@ NoteModel model_body(Reader& in) {
         const auto orders = in.value<std::uint32_t>();
         in.check(in_range(frame.hz, 29., 2401.) && in_range(frame.support, 0., 1.) &&
                  orders <= 4095 && orders <= in.remaining()/8, "invalid harmonic frame");
-        frame.harmonics.resize(orders);
-        for (auto& coefficient : frame.harmonics) {
-            const float real = in.value<float>(), imag = in.value<float>();
-            in.check(in_range(real, -1.e6, 1.e6) && in_range(imag, -1.e6, 1.e6), "invalid harmonic coefficient");
-            coefficient = {real, imag};
-        }
+        in.complex_floats(frame.harmonics, orders);
+        for (const auto& c : frame.harmonics)
+            in.check(in_range(c.real(), -1.e6, 1.e6) && in_range(c.imag(), -1.e6, 1.e6), "invalid harmonic coefficient");
         in.check(!orders || (frame.harmonics[0].real() >= 0.f && frame.harmonics[0].imag() == 0.f),
                  "invalid H1 phase reference");
     }
@@ -139,10 +149,7 @@ void model_body(Writer& out, const NoteModel& m) {
         out.value(frame.hz);
         out.value(frame.support);
         out.value<std::uint32_t>(static_cast<std::uint32_t>(frame.harmonics.size()));
-        for (const auto coefficient : frame.harmonics) {
-            out.value(coefficient.real());
-            out.value(coefficient.imag());
-        }
+        out.complex_floats(frame.harmonics);
     }
 }
 

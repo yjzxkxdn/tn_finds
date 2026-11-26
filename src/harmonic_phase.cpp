@@ -167,28 +167,48 @@ double radiation_phase(double hz) {
 }
 } // namespace
 
-void source_filter_spectrum(const std::vector<Complex>& spectrum, int source_orders,
-                            double source_hz, double target_hz, double rd, double formant_ratio,
-                            std::vector<double>& phase, std::vector<float>* amplitude) {
+float source_filter_spectrum(const std::vector<Complex>& spectrum, int source_orders,
+                             double source_hz, double target_hz, double rd, double formant_ratio,
+                             std::vector<double>& phase, std::vector<float>* amplitude,
+                             SourceFilterWork& work) {
     phase.clear();
     if (amplitude) amplitude->clear();
-    if (rd <= 0. || source_orders < 4) return;
+    if (rd <= 0. || source_orders < 4) return 0.f;
     const int orders = static_cast<int>(std::ceil(source_orders*source_hz/target_hz));
-    if (orders < 2) return;
+    if (orders < 2) return 0.f;
     float peak = 0.f;
-    for (int k = 1; k <= source_orders; ++k) peak = std::max(peak, std::abs(spectrum[k]));
-    if (peak <= 1.e-10f) return;
-
-    std::vector<std::complex<double>> lf;
-    lf_spectrum(rd, std::max(source_orders, orders), lf);
-    std::vector<double> tract(source_orders+1), target_tract(orders+1);
+    work.source_magnitude.resize(source_orders+1);
     for (int k = 1; k <= source_orders; ++k) {
-        const double measured = std::max(double(std::abs(spectrum[k])/peak), 1.e-5);
+        const float magnitude = std::abs(spectrum[k]);
+        work.source_magnitude[k] = magnitude;
+        peak = std::max(peak, magnitude);
+    }
+    if (peak <= 1.e-10f) return peak;
+
+    const int fit_orders = std::max(source_orders, orders);
+    if (work.fitted_rd != rd) {
+        work.lf.clear();
+        work.lf_magnitude.clear();
+        work.fitted_rd = rd;
+    }
+    if (work.lf.size() <= static_cast<std::size_t>(fit_orders)) lf_spectrum(rd, fit_orders, work.lf);
+    const int amplitude_orders = amplitude ? std::min(orders, static_cast<int>(8000./target_hz)) : 0;
+    const int magnitude_orders = std::max(source_orders, amplitude_orders);
+    const int first_missing = std::max(1, static_cast<int>(work.lf_magnitude.size()));
+    if (first_missing <= magnitude_orders) {
+        work.lf_magnitude.resize(magnitude_orders+1);
+        for (int k = first_missing; k <= magnitude_orders; ++k) work.lf_magnitude[k] = std::abs(work.lf[k]);
+    }
+    auto& tract = work.tract;
+    auto& target_tract = work.target_tract;
+    tract.resize(source_orders+1);
+    target_tract.resize(orders+1);
+    for (int k = 1; k <= source_orders; ++k) {
+        const double measured = std::max(double(work.source_magnitude[k]/peak), 1.e-5);
         const double input_lip = radiation_argument(k*source_hz);
-        tract[k] = std::log(measured) - std::log(std::max(1.e-14, std::abs(lf[k]))) +
+        tract[k] = std::log(measured) - std::log(std::max(1.e-14, work.lf_magnitude[k])) +
                    .5*std::log1p(input_lip*input_lip);
     }
-    const int amplitude_orders = amplitude ? std::min(orders, static_cast<int>(8000./target_hz)) : 0;
     if (amplitude) amplitude->resize(amplitude_orders+1);
     for (int k = 1; k <= orders; ++k) {
         const double target_frequency = k*target_hz;
@@ -205,23 +225,23 @@ void source_filter_spectrum(const std::vector<Complex>& spectrum, int source_ord
             // A common gain is handled by the synthesis table's power match.
             const double lip = radiation_argument(target_frequency);
             (*amplitude)[k] = static_cast<float>(peak*std::exp(target_tract[k])*
-                                                std::abs(lf[k])/std::sqrt(1.+lip*lip));
+                                                work.lf_magnitude[k]/std::sqrt(1.+lip*lip));
         }
     }
 
-    std::vector<double> source_minimum;
+    auto& source_minimum = work.source_minimum;
     tract_minimum_phase(tract, source_minimum);
     tract_minimum_phase(target_tract, phase);
     const double source_h1 = std::arg(spectrum[1])-source_minimum[1]-radiation_phase(source_hz);
     const double target_filter_h1 = phase[1]+radiation_phase(target_hz);
     for (int k = 2; k <= orders; ++k) {
-        double excitation = std::arg(lf[k]);
-        if (k <= source_orders) {
-            excitation = std::arg(spectrum[k])-source_minimum[k]-radiation_phase(k*source_hz)-k*source_h1;
-        }
+        const double excitation = k <= source_orders ?
+            std::arg(spectrum[k])-source_minimum[k]-radiation_phase(k*source_hz)-k*source_h1 :
+            std::arg(work.lf[k]);
         phase[k] = std::remainder(excitation+phase[k]+radiation_phase(k*target_hz)-k*target_filter_h1, 2.*pi);
     }
     phase[1] = 0.;
+    return peak;
 }
 
 void lock_harmonic_phase(const std::vector<float>& source, const std::vector<double>& src,

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "note_model.hpp"
+#include "pitch.hpp"
 
 #include <cstddef>
 #include <vector>
@@ -27,12 +28,13 @@ struct Options {
     // Moresampler-style controls; all neutral at zero.
     double tension = 0, breathiness = 0, mouth = 0, resonance = 0, formant_emphasis = 0;
     bool force_loop = false; // prefer cycling even for short extensions
+    pitch::Track mrq_f0; // whole-recording, original sample clock; empty if unavailable
 };
 
 struct Report {
     double analysis_ms = 0, synthesis_ms = 0, source_pitch_hz = 0;
     std::size_t input_samples = 0, output_samples = 0, islands = 0;
-    bool bypass = false, loop_used = false;
+    bool bypass = false, loop_used = false, analysis_cache_hit = false;
     const char* f0_backend = "standard";
 };
 

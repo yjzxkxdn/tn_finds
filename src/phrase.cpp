@@ -245,11 +245,24 @@ std::vector<float> synthesize_phrase(const std::vector<Clip>& clips, int size, i
         std::optional<detail::Sinc> sinc;
         if (note.sample_rate != sr) sinc.emplace(note.residual, double(note.sample_rate)/sr);
         harmonics = harmonics || !note.frames.empty();
-        for (int n = first; n < ends[i]; ++n) {
-            const double at = source_at(clip, n, sr);
-            if (at < 0. || at >= available) continue;
-            const float sample = sinc ? sinc->read(at, 0, available) : note.residual[static_cast<int>(at)];
-            result[n] += static_cast<float>(clip.gain(n)*sample);
+        const double offset = std::round(clip.offset*note.sample_rate/1000.);
+        if (!sinc) {
+            // At equal sample rates the original rounded offset and source
+            // cursor are integers. Clip to the recorded interval once.
+            const double origin = clip.left-offset;
+            const double lo = std::max(double(first), origin);
+            const double hi = std::min(double(ends[i]), origin+available);
+            if (lo >= hi) continue;
+            int at = static_cast<int>(lo-origin);
+            const int stop = static_cast<int>(hi);
+            for (int n = static_cast<int>(lo); n < stop; ++n, ++at)
+                result[n] += static_cast<float>(clip.gain(n)*note.residual[at]);
+        } else {
+            for (int n = first; n < ends[i]; ++n) {
+                const double at = offset+double(n-clip.left)*note.sample_rate/sr;
+                if (at < 0. || at >= available) continue;
+                result[n] += static_cast<float>(clip.gain(n)*sinc->read(at, 0, available));
+            }
         }
     }
     if (!harmonics || size == 0) return result;

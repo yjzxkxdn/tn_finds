@@ -249,7 +249,8 @@ std::size_t HarmonicSplit::regions() const {
 
 HarmonicSplit split_harmonic(const std::vector<float>& x, int sr,
                              const std::vector<double>& marks, const pitch::Track& track,
-                             bool cleanup, double amount, const pitch::Track* automatic_track) {
+                             bool cleanup, double amount, const pitch::Track* automatic_track,
+                             const std::vector<pitch::Island>* located_automatic, bool authoritative_uv) {
     HarmonicSplit out;
     if (marks.size() < 2 || x.size() < 8) return out;
     // The trial clock spans the whole clip, including frames with no reliable
@@ -293,7 +294,8 @@ HarmonicSplit split_harmonic(const std::vector<float>& x, int sr,
             if (f.hz > 0.) f.hz = pitch::sample(track, static_cast<double>(i)*seed.step).hz;
         }
     }
-    const auto voiced = pitch::locate(x, sr, voiced_track);
+    const auto located = located_automatic ? std::vector<pitch::Island>{} : pitch::locate(x, sr, voiced_track);
+    const auto& voiced = located_automatic ? *located_automatic : located;
     auto average = voiced.empty() ? std::vector<float>{} : cycle_average(x, voiced);
     if (!average.empty()) return_breath(x, sr, marks, voiced, average, amount);
     std::vector<float> high_band(average.size());
@@ -489,6 +491,33 @@ HarmonicSplit split_harmonic(const std::vector<float>& x, int sr,
                 const float edge = std::min(ease(2.*(i-p.front())/(p[1]-p.front())),
                                             ease(2.*(p.back()-i)/(p.back()-p[p.size()-2])));
                 out.harmonic[i] += edge*ease((out.activity(i)-.025)/.175)*high_band[i];
+            }
+        }
+    }
+    if (authoritative_uv && !seed.frames.empty()) {
+        // The trial clock may bridge MRQ zero frames for alignment, but
+        // it must not turn those deliberately unvoiced regions into a
+        // harmonic stem. Fade over the voiced half of a transition;
+        // keep the excluded waveform in the residual instead of muting it.
+        const auto gate = [&](double at) {
+            const auto p = std::clamp(at/seed.step, 0., double(seed.frames.size()-1));
+            const auto k = static_cast<std::size_t>(p);
+            const bool a = seed.frames[k].hz > 0.;
+            const bool b = seed.frames[std::min(k+1, seed.frames.size()-1)].hz > 0.;
+            if (a == b) return a ? 1.f : 0.f;
+            const double u = p-k;
+            return ease(a ? 1.-2.*u : 2.*u-1.);
+        };
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto weight = gate(double(i)*hop);
+            out.strength[i] *= weight;
+            out.periodic_share[i] *= weight;
+        }
+        if (!out.harmonic.empty()) {
+            for (int i = 0; i < len; ++i) {
+                const auto weight = gate(i);
+                out.harmonic[i] *= weight;
+                if (cleanup) out.cleanup[i] *= weight;
             }
         }
     }

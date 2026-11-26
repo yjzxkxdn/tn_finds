@@ -99,32 +99,32 @@ public:
     }
 };
 
-struct FitShape {
-    std::array<double,fit_orders> inverse;
-    std::array<double,fit_orders> scale, offset;
-    explicit FitShape(double rd) {
-        const LfPulse pulse(rd);
-        double sum = 0., sum_log = 0.;
-        for (int j = 0; j < fit_orders; ++j) {
-            const double a = pulse.amplitude(j+1)/(j+1);
-            const double p = a*a;
-            inverse[j] = 1./p;
-            sum += p;
-            sum_log += std::log(p);
-            scale[j] = sum;
-            offset[j] = sum_log-(j+1)*std::log(sum);
+using Candidates = std::array<double, tension_axis.size()>;
+
+struct FitShapes {
+    // Keep candidates contiguous so the fit can vectorize independent sums
+    // without changing the addition order within each candidate.
+    std::array<Candidates, fit_orders> inverse;
+    std::array<std::array<double, fit_orders>, tension_axis.size()> scale, offset;
+    FitShapes() {
+        for (std::size_t j = 0; j < tension_axis.size(); ++j) {
+            const LfPulse pulse(rd_min+rd_step*j);
+            double sum = 0., sum_log = 0.;
+            for (int k = 0; k < fit_orders; ++k) {
+                const double a = pulse.amplitude(k+1)/(k+1);
+                const double p = a*a;
+                inverse[k][j] = 1./p;
+                sum += p;
+                sum_log += std::log(p);
+                scale[j][k] = sum;
+                offset[j][k] = sum_log-(k+1)*std::log(sum);
+            }
         }
     }
 };
 
-const auto& fit_shapes() {
-    static const auto shapes = [] {
-        std::vector<FitShape> result;
-        result.reserve(tension_axis.size());
-        for (std::size_t j = 0; j < tension_axis.size(); ++j)
-            result.emplace_back(rd_min+rd_step*j);
-        return result;
-    }();
+const FitShapes& fit_shapes() {
+    static const FitShapes shapes;
     return shapes;
 }
 } // namespace
@@ -155,14 +155,17 @@ double estimate_rd(const std::vector<Complex>& spectrum, int harmonics, double f
     if (sum < 1.e-12 || higher < sum*1.e-5) return 0.;
     for (int j = 0; j < n; ++j) power[j] = std::max(1.e-10, power[j]/sum);
     const auto& shapes = fit_shapes();
-    std::array<double,tension_axis.size()> distance;
+    Candidates ratios{};
+    for (int k = 0; k < n; ++k) {
+        const auto& inverse = shapes.inverse[k];
+        for (std::size_t j = 0; j < ratios.size(); ++j)
+            ratios[j] += power[k]*inverse[j];
+    }
+    Candidates distance;
     int best = 0;
     for (int j = 0; j < static_cast<int>(distance.size()); ++j) {
-        const auto& s = shapes[j];
-        double ratio = 0.;
-        for (int k = 0; k < n; ++k) ratio += power[k]*s.inverse[k];
         // Itakura-Saito divergence, omitting terms common to all candidates.
-        distance[j] = ratio*s.scale[n-1]+s.offset[n-1];
+        distance[j] = ratios[j]*shapes.scale[j][n-1]+shapes.offset[j][n-1];
         if (distance[j] < distance[best]) best = j;
     }
     double fine = 0.;

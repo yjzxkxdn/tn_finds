@@ -20,11 +20,14 @@ struct HarmonicSplit {
     std::size_t regions() const;
 };
 
-// Supply the original automatic F0 track when available. The continuous
-// track and marks are used for low-frequency protection and ridge evidence.
+// Supply the original F0 track when available. The continuous trial track
+// and marks are used for low-frequency protection and ridge evidence.
+// MRQ's authoritative UV labels may also gate the separated harmonic stem.
 HarmonicSplit split_harmonic(const std::vector<float>& x, int sr,
                              const std::vector<double>& marks, const pitch::Track& track,
                              bool suppress_low_residue, double amount = default_mask_return,
-                             const pitch::Track* automatic_track = nullptr);
+                             const pitch::Track* automatic_track = nullptr,
+                             const std::vector<pitch::Island>* located_automatic = nullptr,
+                              bool authoritative_uv = false);
 
 } // namespace tn::detail

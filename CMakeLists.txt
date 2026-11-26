@@ -1,12 +1,30 @@
 # SPDX-License-Identifier: GPL-3.0-only
 cmake_minimum_required(VERSION 3.16)
-project(tn_finds VERSION 0.4.8 LANGUAGES CXX)
+project(tn_finds VERSION 0.4.9 LANGUAGES CXX)
 
 add_library(tn_finds_engine STATIC src/engine.cpp src/pitch.cpp src/formant.cpp src/glottal.cpp
     src/harmonic_phase.cpp src/harmonic_mask.cpp src/harmonic_ridges.cpp src/harmonic_synth.cpp)
 include(cmake/Nebula.cmake)
-add_executable(tn_finds_resampler src/main.cpp src/wav.cpp)
-add_executable(tn_finds src/main.cpp src/wav.cpp src/wavtool.cpp src/bat_host.cpp src/phrase.cpp src/phrase_io.cpp)
+set(dsp_openmp_default OFF)
+if(TARGET tn_finds_nebula)
+    set(dsp_openmp_default ON)
+endif()
+option(TN_FINDS_DSP_OPENMP "Parallelize independent ridge frames of long OTO clips" ${dsp_openmp_default})
+if(TN_FINDS_DSP_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_link_libraries(tn_finds_engine PRIVATE OpenMP::OpenMP_CXX)
+    if(MINGW)
+        target_link_options(tn_finds_engine INTERFACE ${OpenMP_CXX_FLAGS})
+    endif()
+endif()
+include(cmake/AnalysisCache.cmake)
+set(cli_sources src/main.cpp src/wav.cpp src/mrq.cpp src/mrq_binding.cpp)
+add_executable(tn_finds_resampler ${cli_sources})
+add_executable(tn_finds ${cli_sources} src/wavtool.cpp src/bat_host.cpp src/phrase.cpp src/phrase_io.cpp)
+if(WIN32)
+    target_link_libraries(tn_finds_resampler PRIVATE bcrypt)
+    target_link_libraries(tn_finds PRIVATE bcrypt)
+endif()
 target_compile_definitions(tn_finds PRIVATE TN_FINDS_DUAL_ROLE=1)
 set(TN_FINDS_VERSION "${PROJECT_VERSION}" CACHE STRING "Version label reported by the executable")
 foreach(target IN ITEMS tn_finds_resampler tn_finds)
@@ -52,5 +70,20 @@ if(TN_FINDS_TESTS)
     if(TARGET tn_finds_nebula)
         add_test(NAME nebula_f0_regression COMMAND ${Python3_EXECUTABLE} -B
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nebula_f0.py $<TARGET_FILE:tn_finds_resampler>)
+        if(WIN32)
+            add_test(NAME nebula_cache_regression COMMAND ${Python3_EXECUTABLE} -B
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nebula_cache.py $<TARGET_FILE:tn_finds_resampler>)
+        endif()
     endif()
+    if(WIN32)
+        # No test uses the user's cache or an earlier test's results.
+        get_property(regressions DIRECTORY PROPERTY TESTS)
+        set_tests_properties(${regressions} PROPERTIES ENVIRONMENT "TN_FINDS_NEBULA_CACHE=off;TN_FINDS_ANALYSIS_CACHE=off;TN_FINDS_MRQ_BINDINGS=off")
+        add_test(NAME source_analysis_cache_regression COMMAND ${Python3_EXECUTABLE} -B
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_source_analysis_cache.py
+            $<TARGET_FILE:tn_finds_resampler> $<TARGET_FILE:tn_finds>)
+    endif()
+    add_test(NAME mrq_source_regression COMMAND ${Python3_EXECUTABLE} -B
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mrq.py
+        $<TARGET_FILE:tn_finds_resampler> $<TARGET_FILE:tn_finds>)
 endif()

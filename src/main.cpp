@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "engine.hpp"
+#include "mrq.hpp"
+#include "mrq_binding.hpp"
 #include "pitch.hpp"
 #include "wav.hpp"
+
+#ifdef _WIN32
+#include "cache_win.hpp"
+#else
+#include <cstdlib>
+#endif
 
 #ifndef TN_FINDS_DUAL_ROLE
 #define TN_FINDS_DUAL_ROLE 0
@@ -28,7 +36,7 @@
 #include <vector>
 
 #ifndef TN_FINDS_VERSION
-#define TN_FINDS_VERSION "0.4.8"
+#define TN_FINDS_VERSION "0.4.9"
 #endif
 
 namespace {
@@ -43,9 +51,40 @@ struct Job {
     tn::Options options;
     bool pcm16 = false;
     bool report = false;
+    bool use_mrq = true;
 };
 
 [[noreturn]] void bad(const std::string& text) { throw std::invalid_argument(text); }
+
+bool mrq_enabled() {
+#ifdef _WIN32
+    return tn::detail::cache::environment(L"TN_FINDS_MRQ") != L"off";
+#else
+    const auto value = std::getenv("TN_FINDS_MRQ");
+    return !value || std::string_view(value) != "off";
+#endif
+}
+
+tn::pitch::Track source_mrq(const fs::path& input, const tn::wav::Audio& audio) {
+    if (!mrq_enabled()) return {};
+    // An explicit OpenUtau binding to the original recording wins over a
+    // leftover MRQ for the renamed host copy. With no binding, a local entry
+    // (including one generated for that host copy) is usable on its own.
+    auto bound = tn::pitch::lookup_bound_mrq(input, audio.samples, audio.sample_rate);
+    if (!bound.frames.empty()) return bound;
+    try {
+        return tn::pitch::read_mrq(input.parent_path()/"desc.mrq", input.filename().u16string(),
+                                   audio.sample_rate, audio.samples.size());
+    } catch (const fs::filesystem_error&) {
+        return {};
+    }
+}
+
+void protect_mrq(const fs::path& output) {
+    auto extension = output.extension().u8string();
+    for (auto& c : extension) if (c >= 'A' && c <= 'Z') c += 'a'-'A';
+    if (extension == ".mrq") bad("output must not overwrite an MRQ pitch file");
+}
 
 bool space(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 bool digit(char c) { return c >= '0' && c <= '9'; }
@@ -351,6 +390,8 @@ Job native(const Args& args) {
             if (!job.f0_csv.empty()) bad("--f0 may only be specified once");
             job.f0_csv = value();
             if (job.f0_csv.empty()) bad("--f0 requires a nonempty path");
+        } else if (option == "--no-mrq") {
+            job.use_mrq = false;
         } else if (option == "--phase-lock") {
             o.phase_lock = true;
         } else if (option == "--grain-formant") {
@@ -395,7 +436,9 @@ void print_help(std::ostream& stream) {
 Usage:
   tn_finds input output note velocity flags offset length consonant cutoff volume modulation [!tempo [pitchbend]]
   tn_finds --render input.wav output.wav [options]
-  tn_finds --estimate-f0 input.wav track.csv
+  tn_finds --estimate-f0 input.wav track.csv [--no-mrq]
+  tn_finds --write-mrq input.wav|voicebank-directory [desc.mrq]   (Nebula build)
+  tn_finds --bind-mrq original.wav|voicebank-directory (Windows)
   tn_finds --help | --version
 
 )";
@@ -423,7 +466,9 @@ An explicit --wavtool command uses ordinary PCM overlap-add.
   --fixed-residual-mix N  Tnc: same control for the OTO fixed region, 0..100 (default 0).
   --grain-formant      Use envelope-free grain warping instead of spectral gain.
   --phase-lock         Try source-relative harmonic phase on edited voiced grains.
-  --f0 TRACK.csv       Source F0, header time_s,f0_hz; absolute input seconds, 0=no F0 hint.
+  --f0 TRACK.csv       Source F0 override, header time_s,f0_hz; absolute input seconds, 0=no F0 hint.
+  --no-mrq             Ignore an otherwise matching MRQ. TN_FINDS_MRQ=off also affects classic calls.
+                       Default MRQ entry: desc.mrq beside the input, keyed by its filename.
   --length-ms N        Output duration, -1 keeps the duration of the selected input.
   --offset-ms N        Begin at this point in the input, default 0 ms.
   --cutoff-ms N        End trim (negative: take this many ms after offset), default 0.
@@ -483,6 +528,7 @@ void print_report(const tn::Report& r) {
         << ",\"source_pitch_hz\":" << r.source_pitch_hz << ",\"input_samples\":" << r.input_samples
         << ",\"output_samples\":" << r.output_samples << ",\"islands\":" << r.islands
         << ",\"bypass\":" << r.bypass << ",\"loop_used\":" << r.loop_used
+        << ",\"analysis_cache_hit\":" << r.analysis_cache_hit
         << ",\"f0_backend\":\"" << r.f0_backend << "\"}";
     std::cout << out.str() << '\n';
 }
@@ -500,11 +546,84 @@ int run(const Args& args) {
         std::cout << "tn_finds " << TN_FINDS_VERSION << (TN_FINDS_DUAL_ROLE ? "-phrase\n" : "-resampler\n");
         return 0;
     }
+    if (command == "--bind-mrq") {
+#ifdef _WIN32
+        if (args.size() != 2) bad("--bind-mrq requires one original WAV or voicebank directory");
+        if (!mrq_enabled()) bad("MRQ is disabled by TN_FINDS_MRQ=off");
+        const auto count = tn::pitch::bind_mrq_sources(args[1]);
+        if (!count) throw std::runtime_error("no valid MRQ entries could be bound for the selected source");
+        std::cout << "Bound " << count << " MRQ source recording(s).\n";
+        return 0;
+#else
+        bad("--bind-mrq is only available on Windows");
+#endif
+    }
+    if (command == "--write-mrq") {
+        // Produce the entries a Moresampler-style voicebank ships: measure each
+        // recording, then store its trajectory beside it in desc.mrq.
+        if (args.size() < 2 || args.size() > 4)
+            bad("--write-mrq requires a WAV or voicebank directory [output MRQ]");
+        if (!mrq_enabled()) bad("MRQ is disabled by TN_FINDS_MRQ=off");
+        if (!tn::pitch::nebula_source_backend())
+            // A desc.mrq is a Moresampler-compatible trajectory. This build
+            // measures with the default estimator, whose grid and voicing
+            // differ, so writing one here would label foreign data as a Nebula
+            // result.
+            bad("--write-mrq requires the Nebula F0 backend; this build uses the default estimator");
+        const std::filesystem::path target(args[1]);
+        std::error_code ec;
+        const bool directory = std::filesystem::is_directory(target, ec);
+        if (directory && args.size() == 3) bad("--write-mrq takes the output path only for one WAV");
+        std::vector<std::filesystem::path> sources;
+        if (directory) {
+            for (const auto& item : std::filesystem::recursive_directory_iterator(target, ec)) {
+                if (!item.is_regular_file()) continue;
+                const auto ext = item.path().extension().u8string();
+                if (ext == ".wav" || ext == ".WAV") sources.push_back(item.path());
+            }
+            std::sort(sources.begin(), sources.end());
+        } else {
+            sources.push_back(target);
+        }
+        if (sources.empty()) throw std::runtime_error("no WAV recordings were found");
+        std::size_t written = 0, skipped = 0;
+        for (const auto& source : sources) {
+            try {
+                const auto audio = tn::wav::read(source);
+                const auto track = tn::pitch::estimate_source(audio.samples, audio.sample_rate);
+                if (track.frames.empty()) { ++skipped; continue; }
+                const auto mrq = (directory || args.size() < 3)
+                                     ? source.parent_path()/L"desc.mrq"
+                                     : std::filesystem::path(args[2]);
+                tn::wav::require_distinct(source, mrq);
+                if (!tn::pitch::write_mrq(mrq, source.filename().u16string(), track, audio.sample_rate)) {
+                    ++skipped;
+                    continue;
+                }
+                ++written;
+                if (!directory)
+                    std::cout << "Wrote " << track.frames.size() << " frames at hop " << track.step
+                              << " into " << mrq.u8string() << '\n';
+            } catch (const std::exception& e) {
+                ++skipped;
+                if (!directory) throw;
+                std::cerr << "tn_finds: skipped " << source.u8string() << ": " << e.what() << '\n';
+            }
+        }
+        if (directory)
+            std::cout << "Wrote " << written << " MRQ entr" << (written == 1 ? "y" : "ies")
+                      << ", skipped " << skipped << " recording(s).\n";
+        else if (!written) throw std::runtime_error("could not write the MRQ entry");
+        return 0;
+    }
     if (command == "--estimate-f0") {
-        if (args.size() != 3) bad("--estimate-f0 requires input WAV and output CSV paths");
+        const bool no_mrq = args.size() == 4 && args[3] == "--no-mrq";
+        if (args.size() != 3 && !no_mrq) bad("--estimate-f0 requires input WAV and output CSV paths [--no-mrq]");
+        protect_mrq(args[2]);
         tn::wav::require_distinct(args[1], args[2]);
         const auto audio = tn::wav::read(args[1]);
-        const auto track = tn::pitch::estimate_source(audio.samples, audio.sample_rate);
+        auto track = no_mrq ? tn::pitch::Track{} : source_mrq(args[1], audio);
+        if (track.frames.empty()) track = tn::pitch::estimate_source(audio.samples, audio.sample_rate);
         if (track.frames.empty()) throw std::runtime_error("F0 analysis produced no frames");
         std::ofstream csv(args[2]);
         csv.imbue(std::locale::classic());
@@ -533,12 +652,15 @@ int run(const Args& args) {
         bad("select the phrase build for wavtool or note-model commands");
     auto job = native_render ? native(args) : classic(args);
 #endif
+    protect_mrq(job.output);
     tn::wav::require_distinct(job.input, job.output);
     if (!job.f0_csv.empty()) {
         tn::wav::require_distinct(job.f0_csv, job.output);
         job.options.f0 = read_f0(job.f0_csv);
     }
     auto audio = tn::wav::read(job.input);
+    if (job.use_mrq && job.options.f0.empty() && job.options.forced_hz == 0.)
+        job.options.mrq_f0 = source_mrq(job.input, audio);
 #if TN_FINDS_DUAL_ROLE
     if (!native_render) {
         const auto model = tn::prepare_note(audio.samples, audio.sample_rate, job.options);
